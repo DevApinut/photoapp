@@ -28,6 +28,9 @@ def test_upload_and_deduplicate(tmp_path, monkeypatch):
     info = json.loads((tmp_path / "PhotoBackup/ABC/LHAY69002508/Point 1/_DN_INFO.json").read_text(encoding="utf-8"))
     assert info["job"] == "LHAY69002508"
     assert info["photos"][0]["captured_at"] == "2026-08-05T14:32:18+07:00"
+    catalog = client.get("/catalog").json()["photos"]
+    assert catalog[0]["hash"] == digest
+    assert client.get(f"/photo/{digest}").content == content
 
     same_photo_new_job = dict(data, job_name="LHAY69002509", location_name="Point 2")
     third = client.post("/upload", data=same_photo_new_job, files={"photo": ("x.jpg", content, "image/jpeg")})
@@ -92,3 +95,14 @@ def test_reuploads_when_backup_file_was_moved(tmp_path, monkeypatch):
     assert first.json()["status"] == "uploaded"
     assert second.json()["status"] == "uploaded"
     assert saved.read_bytes() == content
+
+
+def test_same_job_name_with_different_ids_is_separated(tmp_path, monkeypatch):
+    monkeypatch.setenv("PHOTO_SYNC_DATA", str(tmp_path))
+    import app as module
+    module = importlib.reload(module); module.init_db(); client = TestClient(module.app)
+    first = client.post("/folder", json={"job_id":"job-a", "client_name":"งานทั่วไป", "job_name":"ชื่องานซ้ำ", "location_name":"จุด 1"})
+    second = client.post("/folder", json={"job_id":"job-b", "client_name":"งานทั่วไป", "job_name":"ชื่องานซ้ำ", "location_name":"จุด 1"})
+    assert first.status_code == second.status_code == 200
+    assert (tmp_path / "PhotoBackup/ชื่องานซ้ำ/จุด 1").is_dir()
+    assert (tmp_path / "PhotoBackup/ชื่องานซ้ำ (2)/จุด 1").is_dir()

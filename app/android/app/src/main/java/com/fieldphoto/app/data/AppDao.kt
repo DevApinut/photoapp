@@ -40,6 +40,8 @@ interface AppDao {
     @Query("SELECT j.* FROM jobs j JOIN clients c ON c.id = j.clientId WHERE c.name = 'งานทั่วไป' ORDER BY j.name COLLATE NOCASE ASC")
     fun quickJobsByName(): Flow<List<JobEntity>>
     @Query("SELECT * FROM jobs WHERE clientId = :id ORDER BY createdAt DESC") fun jobs(id: String): Flow<List<JobEntity>>
+    @Query("SELECT * FROM jobs ORDER BY name COLLATE NOCASE") suspend fun allJobsNow(): List<JobEntity>
+    @Query("SELECT * FROM locations ORDER BY jobId, name") suspend fun allLocationsNow(): List<LocationEntity>
     @Query("SELECT * FROM locations WHERE jobId = :id ORDER BY createdAt") fun locations(id: String): Flow<List<LocationEntity>>
     @Query("SELECT * FROM locations WHERE jobId = :id") suspend fun locationsNow(id: String): List<LocationEntity>
     @Query("SELECT * FROM photos WHERE locationId = :id ORDER BY capturedAt DESC") fun photos(id: String): Flow<List<PhotoEntity>>
@@ -55,10 +57,12 @@ interface AppDao {
     @Query("SELECT * FROM clients WHERE id = :id") suspend fun client(id: String): ClientEntity
     @Query("SELECT * FROM clients WHERE name = :name LIMIT 1") suspend fun clientByName(name: String): ClientEntity?
     @Query("SELECT * FROM jobs WHERE id = :id") suspend fun job(id: String): JobEntity
+    @Query("SELECT * FROM jobs WHERE clientId=:clientId AND name=:name LIMIT 1") suspend fun jobByName(clientId: String, name: String): JobEntity?
     @Query("SELECT EXISTS(SELECT 1 FROM jobs WHERE clientId = :clientId AND name = :name AND id != :excludeId)")
     suspend fun jobNameExists(clientId: String, name: String, excludeId: String): Boolean
     @Query("UPDATE jobs SET name = :name WHERE id = :id") suspend fun renameJob(id: String, name: String)
     @Query("SELECT * FROM locations WHERE id = :id") suspend fun location(id: String): LocationEntity
+    @Query("SELECT * FROM locations WHERE jobId=:jobId AND name=:name LIMIT 1") suspend fun locationByName(jobId: String, name: String): LocationEntity?
     @Query("SELECT * FROM locations WHERE jobId = :jobId ORDER BY createdAt LIMIT 1")
     suspend fun firstLocation(jobId: String): LocationEntity?
     @Query("SELECT * FROM locations WHERE jobId = :jobId AND name = '' LIMIT 1")
@@ -66,6 +70,14 @@ interface AppDao {
     @Query("SELECT * FROM photos WHERE id = :id") suspend fun photo(id: String): PhotoEntity
     @Query("UPDATE photos SET status = :status, lastError = :error WHERE id = :id")
     suspend fun setStatus(id: String, status: UploadStatus, error: String? = null)
+    @Query("UPDATE photos SET locationId=:locationId, status='WAITING', lastError=NULL WHERE id IN (:ids)")
+    suspend fun movePhotos(ids: List<String>, locationId: String)
+    @Query("UPDATE documents SET locationId=:locationId, status='WAITING', lastError=NULL WHERE id=:id")
+    suspend fun moveDocument(id: String, locationId: String)
+    @Query("UPDATE notes SET locationId=:locationId, status='WAITING', lastError=NULL WHERE id=:id")
+    suspend fun moveNote(id: String, locationId: String)
+    @Query("SELECT * FROM documents WHERE locationId=:locationId") suspend fun documentsNow(locationId: String): List<DocumentEntity>
+    @Query("SELECT * FROM notes WHERE locationId=:locationId") suspend fun notesNow(locationId: String): List<NoteEntity>
     @Query("UPDATE photos SET sha256 = :sha256 WHERE id = :id")
     suspend fun updatePhotoHash(id: String, sha256: String)
     @Query("SELECT * FROM documents WHERE locationId=:locationId ORDER BY createdAt DESC") fun documents(locationId: String): Flow<List<DocumentEntity>>
@@ -83,7 +95,7 @@ interface AppDao {
     suspend fun folderTree(jobId: String, path: String, prefix: String): List<LocationEntity>
 
     @Query("""
-        SELECT p.id, p.sha256, p.contentUri, p.filename, p.capturedAt, p.latitude, p.longitude, p.accuracy,
+        SELECT p.id, j.id AS jobId, p.sha256, p.contentUri, p.filename, p.capturedAt, p.latitude, p.longitude, p.accuracy,
                l.name AS locationName, j.name AS jobName, c.name AS clientName
         FROM photos p JOIN locations l ON l.id=p.locationId JOIN jobs j ON j.id=l.jobId JOIN clients c ON c.id=j.clientId
         WHERE p.status IN (:statuses) ORDER BY p.capturedAt
@@ -91,21 +103,21 @@ interface AppDao {
     suspend fun syncCandidates(statuses: List<UploadStatus>): List<PendingPhoto>
 
     @Query("""
-        SELECT c.name AS clientName, j.name AS jobName, l.name AS locationName
+        SELECT j.id AS jobId, c.name AS clientName, j.name AS jobName, l.name AS locationName
         FROM locations l JOIN jobs j ON j.id=l.jobId JOIN clients c ON c.id=j.clientId
         ORDER BY c.name, j.name, l.name
     """)
     suspend fun syncFolders(): List<PendingFolder>
 
     @Query("""
-        SELECT d.id,d.contentUri,d.filename,d.sha256,d.pageCount,d.createdAt,
+        SELECT d.id,j.id AS jobId,d.contentUri,d.filename,d.sha256,d.pageCount,d.createdAt,
                l.name AS locationName,j.name AS jobName,c.name AS clientName
         FROM documents d JOIN locations l ON l.id=d.locationId JOIN jobs j ON j.id=l.jobId JOIN clients c ON c.id=j.clientId
         WHERE d.status IN (:statuses) ORDER BY d.createdAt
     """) suspend fun syncDocuments(statuses: List<UploadStatus>): List<PendingDocument>
 
     @Query("""
-        SELECT n.id,n.title,n.content,n.updatedAt,l.name AS locationName,j.name AS jobName,c.name AS clientName
+        SELECT n.id,j.id AS jobId,n.title,n.content,n.updatedAt,l.name AS locationName,j.name AS jobName,c.name AS clientName
         FROM notes n JOIN locations l ON l.id=n.locationId JOIN jobs j ON j.id=l.jobId JOIN clients c ON c.id=j.clientId
         WHERE n.status IN (:statuses) ORDER BY n.updatedAt
     """) suspend fun syncNotes(statuses: List<UploadStatus>): List<PendingNote>

@@ -48,12 +48,12 @@ data class PhotoEntity(
 )
 
 data class PendingPhoto(
-    val id: String, val sha256: String, val contentUri: String, val filename: String,
+    val id: String, val jobId: String, val sha256: String, val contentUri: String, val filename: String,
     val capturedAt: String, val latitude: Double?, val longitude: Double?, val accuracy: Float?,
     val locationName: String, val jobName: String, val clientName: String,
 )
 
-data class PendingFolder(val clientName: String, val jobName: String, val locationName: String)
+data class PendingFolder(val jobId: String, val clientName: String, val jobName: String, val locationName: String)
 
 @Entity(
     tableName = "documents",
@@ -77,12 +77,12 @@ data class NoteEntity(
 )
 
 data class PendingDocument(
-    val id: String, val contentUri: String, val filename: String, val sha256: String, val pageCount: Int,
+    val id: String, val jobId: String, val contentUri: String, val filename: String, val sha256: String, val pageCount: Int,
     val createdAt: String, val locationName: String, val jobName: String, val clientName: String,
 )
 
 data class PendingNote(
-    val id: String, val title: String, val content: String, val updatedAt: String,
+    val id: String, val jobId: String, val title: String, val content: String, val updatedAt: String,
     val locationName: String, val jobName: String, val clientName: String,
 )
 

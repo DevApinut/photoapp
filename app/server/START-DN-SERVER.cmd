@@ -4,7 +4,7 @@ title DN Photo Sync Server
 cd /d "%~dp0"
 
 powershell -NoProfile -Command "try { Invoke-RestMethod 'http://127.0.0.1:8080/health' -TimeoutSec 1 | Out-Null; exit 0 } catch { exit 1 }"
-if errorlevel 1 start "" "%~dp0DN-Photo-Server-V3.exe"
+if errorlevel 1 start "" "%~dp0DN-Photo-Server-V5.exe"
 
 :monitor
 cls

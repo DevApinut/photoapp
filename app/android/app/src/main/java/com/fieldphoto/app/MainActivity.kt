@@ -11,6 +11,9 @@ import android.os.Bundle
 import android.os.Build
 import android.provider.Settings
 import android.provider.MediaStore
+import android.graphics.pdf.PdfRenderer
+import android.graphics.Bitmap
+import android.os.ParcelFileDescriptor
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -19,6 +22,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -47,6 +51,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
@@ -63,6 +68,10 @@ import coil.compose.AsyncImage
 import com.fieldphoto.app.data.*
 import com.fieldphoto.app.sync.SyncClient
 import com.fieldphoto.app.sync.SyncProgress
+import com.fieldphoto.app.sync.CloudClient
+import com.fieldphoto.app.sync.CloudPhoto
+import com.fieldphoto.app.sync.CloudCatalog
+import com.fieldphoto.app.sync.CloudDocument
 import com.fieldphoto.app.media.RecentImage
 import com.google.android.gms.location.LocationServices
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
@@ -70,6 +79,9 @@ import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.time.OffsetDateTime
 import java.time.Instant
 import java.time.ZoneId
@@ -91,6 +103,9 @@ private sealed interface Page {
     data class Places(val job: JobEntity) : Page
     data class Photos(val place: LocationEntity, val title: String = place.name) : Page
     data class Viewer(val photos: List<PhotoEntity>, val initialIndex: Int) : Page
+    data class CloudJob(val jobId: String, val clientName: String, val jobName: String) : Page
+    data class CloudPdf(val document: CloudDocument) : Page
+    data class CloudViewer(val photos: List<CloudPhoto>, val initialIndex: Int) : Page
     data class Camera(val place: LocationEntity, val title: String = place.name) : Page
     data object Settings : Page
 }
@@ -104,6 +119,8 @@ private data class ExternalCapture(
 )
 
 private data class FolderTemplate(val name: String, val folders: List<String>)
+private data class MoveTarget(val job: JobEntity, val location: LocationEntity)
+private data class CloudJobSummary(val jobId: String, val clientName: String, val jobName: String)
 private enum class JobSortMode { LATEST_PHOTO, NAME, CREATED }
 private enum class JobDateFilter { CREATED, LAST_PHOTO }
 
@@ -200,11 +217,11 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
 
     Scaffold(
         topBar = {
-            if (page !is Page.Viewer) TopAppBar(
+            if (page !is Page.Viewer && page !is Page.CloudViewer) TopAppBar(
                 title = { Text(when (val p = page) {
                     Page.Clients -> "งานทั้งหมด"; is Page.Jobs -> p.client.name; is Page.Places -> p.job.name
                     is Page.Photos -> p.title; is Page.Camera -> "ถ่ายรูป — ${p.title}"; Page.Settings -> "ตั้งค่า"
-                    is Page.Viewer -> "รูปภาพ"
+                    is Page.Viewer -> "รูปภาพ"; is Page.CloudJob -> "${p.jobName} — Server"; is Page.CloudPdf -> p.document.filename; is Page.CloudViewer -> "รูปบน Server"
                 }) },
                 navigationIcon = { if (page !is Page.Clients) IconButton(onClick = { back() }) { Icon(Icons.Default.ArrowBack, "กลับ") } },
                 actions = {
@@ -219,7 +236,9 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
             when (val p = page) {
-                Page.Clients -> QuickJobsPage(repo) { place, title -> navigate(Page.Photos(place, title)) }
+                Page.Clients -> QuickJobsPage(repo, serverUrl,
+                    openJob = { place, title -> navigate(Page.Photos(place, title)) },
+                    openCloud = { jobId, client, job -> navigate(Page.CloudJob(jobId, client, job)) })
                 is Page.Jobs -> JobsPage(repo, p.client) { navigate(Page.Places(it)) }
                 is Page.Places -> PlacesPage(repo, p.job) { navigate(Page.Photos(it)) }
                 is Page.Photos -> PhotosPage(repo, p.place, p.title,
@@ -229,6 +248,11 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                     })
                 is Page.Camera -> CameraPage(repo, p.place) { back() }
                 is Page.Viewer -> PhotoViewer(repo, p.photos, p.initialIndex) { back() }
+                is Page.CloudJob -> CloudPhotosPage(repo, serverUrl, p.jobId, p.clientName, p.jobName,
+                    openPdf = { navigate(Page.CloudPdf(it)) },
+                    openPhoto = { photos, index -> navigate(Page.CloudViewer(photos, index)) })
+                is Page.CloudPdf -> CloudPdfPage(serverUrl, p.document)
+                is Page.CloudViewer -> CloudPhotoViewer(repo, serverUrl, p.photos, p.initialIndex) { back() }
                 Page.Settings -> SettingsPage(serverUrl, showTimestamp,
                     saveUrl = { serverUrl = it; prefs.edit().putString("server_url", it).apply() },
                     saveTimestamp = { showTimestamp = it; prefs.edit().putBoolean("show_timestamp", it).apply() })
@@ -283,7 +307,10 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
 }
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
-@Composable private fun QuickJobsPage(repo: PhotoRepository, openJob: (LocationEntity, String) -> Unit) {
+@Composable private fun QuickJobsPage(
+    repo: PhotoRepository, serverUrl: String,
+    openJob: (LocationEntity, String) -> Unit, openCloud: (String, String, String) -> Unit,
+) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val jobPreferences = remember { context.getSharedPreferences("job_list", Context.MODE_PRIVATE) }
@@ -302,6 +329,13 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
         }
     }
     val rows by jobFlow.collectAsStateWithLifecycle(emptyList())
+    var cloudCatalog by remember { mutableStateOf(CloudCatalog()) }
+    var cloudLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(serverUrl, rows) {
+        cloudLoading = true
+        cloudCatalog = runCatching { CloudClient().catalog(serverUrl) }.getOrDefault(CloudCatalog())
+        cloudLoading = false
+    }
     val activityRows by repo.dao.jobActivity().collectAsStateWithLifecycle(emptyList())
     val activityByJob = activityRows.associateBy { it.jobId }
     var dateFilterEnabled by remember { mutableStateOf(false) }
@@ -335,6 +369,12 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 (filterEnd?.let { !value.isAfter(it) } ?: true)
         }
     }
+    val cloudJobs = (cloudCatalog.folders.map { CloudJobSummary(it.jobId, it.clientName, it.jobName) } +
+        cloudCatalog.photos.map { CloudJobSummary(it.jobId, it.clientName, it.jobName) } +
+        cloudCatalog.documents.map { CloudJobSummary(it.jobId, it.clientName, it.jobName) } +
+        cloudCatalog.notes.map { CloudJobSummary(it.jobId, it.clientName, it.jobName) })
+        .filter { jobSearch.isBlank() || it.jobName.contains(jobSearch.trim(), true) }
+        .distinctBy { if (it.jobId.isNotBlank()) it.jobId else "${it.clientName}/${it.jobName}" }
     var selectedJobIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     val selectedJobs = rows.filter { it.id in selectedJobIds }
     val allVisibleJobsSelected = visibleRows.isNotEmpty() && visibleRows.all { it.id in selectedJobIds }
@@ -453,13 +493,31 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 5.dp),
                 style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary
             )
-            if (visibleRows.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(if (rows.isEmpty()) "กด + งานใหม่ เพื่อเริ่มถ่ายรูป" else "ไม่พบงานที่ค้นหา")
+            if (visibleRows.isEmpty() && cloudJobs.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(if (rows.isEmpty() && !cloudLoading) "กด + งานใหม่ เพื่อเริ่มถ่ายรูป" else if (cloudLoading) "กำลังตรวจสอบ Server…" else "ไม่พบงานที่ค้นหา")
             } else LazyColumn(
                 Modifier.weight(1f),
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 92.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                items(cloudJobs, key = { "cloud-${it.jobId}-${it.clientName}-${it.jobName}" }) { cloudJob ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().clickable { openCloud(cloudJob.jobId, cloudJob.clientName, cloudJob.jobName) },
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        tonalElevation = 0.dp,
+                        shadowElevation = 1.dp,
+                    ) {
+                        Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Cloud, "อยู่บน Server", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(cloudJob.jobName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                Text("อยู่บน Server • แตะเพื่อเปิดดู", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
                 items(visibleRows) { row ->
                     val selected = row.id in selectedJobIds
                     ElevatedCard(
@@ -896,6 +954,10 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var noteInfo by remember { mutableStateOf<NoteEntity?>(null) }
     var noteTitle by remember { mutableStateOf("") }
     var noteContent by remember { mutableStateOf("") }
+    var movePhotoIds by remember { mutableStateOf<List<String>>(emptyList()) }
+    var moveFolderSource by remember { mutableStateOf<LocationEntity?>(null) }
+    var moveTargets by remember { mutableStateOf<List<MoveTarget>>(emptyList()) }
+    var showMoveDialog by remember { mutableStateOf(false) }
     val selectedPhotos = rows.filter { it.id in selectedPhotoIds }
     LaunchedEffect(rows) {
         selectedPhotoIds = selectedPhotoIds.intersect(rows.mapTo(mutableSetOf()) { it.id })
@@ -913,6 +975,16 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
 
     fun togglePhoto(photoId: String) {
         selectedPhotoIds = if (photoId in selectedPhotoIds) selectedPhotoIds - photoId else selectedPhotoIds + photoId
+    }
+
+    fun prepareMove(photos: List<String> = emptyList(), folder: LocationEntity? = null) {
+        scope.launch {
+            val jobs = repo.dao.allJobsNow().associateBy { it.id }
+            moveTargets = repo.dao.allLocationsNow().mapNotNull { location -> jobs[location.jobId]?.let { MoveTarget(it, location) } }
+            movePhotoIds = photos
+            moveFolderSource = folder
+            showMoveDialog = true
+        }
     }
 
     fun shareSelectedPhotos() {
@@ -1196,6 +1268,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             ) {
                 IconButton(onClick = { selectedPhotoIds = emptySet() }) { Icon(Icons.Default.Close, "ยกเลิก") }
                 Text("เลือกแล้ว ${selectedPhotos.size} รูป", Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                IconButton(onClick = { prepareMove(selectedPhotos.map { it.id }) }) { Icon(Icons.Default.DriveFileMove, "ย้ายรูป") }
                 IconButton(onClick = ::shareSelectedPhotos) { Icon(Icons.Default.Share, "แชร์รูปที่เลือก") }
                 IconButton(onClick = { showSelectedDeleteOptions = true }) {
                     Icon(Icons.Default.Delete, "ลบรูปที่เลือก", tint = MaterialTheme.colorScheme.error)
@@ -1233,6 +1306,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                         Icon(Icons.Default.Folder, null)
                         Spacer(Modifier.width(12.dp))
                         Text(folder.name.substringAfterLast('/'), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { prepareMove(folder = folder) }) { Icon(Icons.Default.DriveFileMove, "ย้ายโฟลเดอร์") }
                         IconButton(onClick = { folderToDelete = folder }) { Icon(Icons.Default.Delete, "ลบโฟลเดอร์") }
                     }
                 }
@@ -1373,6 +1447,47 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
           }
         }
     }
+    if (showMoveDialog) AlertDialog(
+        onDismissRequest = { showMoveDialog = false },
+        icon = { Icon(Icons.Default.DriveFileMove, null) },
+        title = { Text(if (moveFolderSource == null) "ย้าย ${movePhotoIds.size} รูป" else "ย้ายโฟลเดอร์ ${moveFolderSource?.name?.substringAfterLast('/')}") },
+        text = {
+            Column {
+                Text("เลือกงานและโฟลเดอร์ปลายทาง", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(10.dp))
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 430.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(moveTargets, key = { "${it.job.id}-${it.location.id}" }) { target ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                scope.launch {
+                                    runCatching {
+                                        moveFolderSource?.let { repo.moveFolder(it, target.location) }
+                                            ?: repo.movePhotos(movePhotoIds, target.location.id)
+                                    }.onSuccess {
+                                        selectedPhotoIds = emptySet()
+                                        showMoveDialog = false
+                                        Toast.makeText(context, "ย้ายไป ${target.job.name} แล้ว", Toast.LENGTH_LONG).show()
+                                    }.onFailure { Toast.makeText(context, "ย้ายไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                                }
+                            },
+                            shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Folder, null)
+                                Spacer(Modifier.width(10.dp))
+                                Column {
+                                    Text(target.job.name, fontWeight = FontWeight.Bold)
+                                    Text(target.location.name.ifBlank { "โฟลเดอร์หลัก" }, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = { showMoveDialog = false }) { Text("ยกเลิก") } }
+    )
     if (noteDialog) AlertDialog(
         onDismissRequest = { noteDialog = false; editingNote = null },
         title = { Text(if (editingNote == null) "เพิ่มโน้ต" else "แก้ไขโน้ต") },
@@ -1685,6 +1800,306 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
     )
+}
+
+@Composable private fun CloudPhotoViewer(
+    repo: PhotoRepository, serverUrl: String, photos: List<CloudPhoto>, initialIndex: Int, onBack: () -> Unit,
+) {
+    if (photos.isEmpty()) { LaunchedEffect(Unit) { onBack() }; return }
+    val context = LocalContext.current; val scope = rememberCoroutineScope()
+    val pagerState = rememberPagerState(initialPage = initialIndex.coerceIn(0, photos.lastIndex), pageCount = { photos.size })
+    val photo = photos[pagerState.currentPage]
+    var scale by remember { mutableFloatStateOf(1f) }; var offset by remember { mutableStateOf(Offset.Zero) }
+    var showInfo by remember { mutableStateOf(false) }; var downloading by remember { mutableStateOf(false) }
+    LaunchedEffect(pagerState.currentPage) { scale = 1f; offset = Offset.Zero; showInfo = false }
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        HorizontalPager(state = pagerState, userScrollEnabled = scale == 1f, modifier = Modifier.fillMaxSize()) { page ->
+            val item = photos[page]
+            AsyncImage(
+                CloudClient().photoUrl(serverUrl, item.hash), item.filename,
+                Modifier.fillMaxSize().pointerInput(item.hash) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            if (event.changes.count { it.pressed } >= 2 || scale > 1f) {
+                                val next = (scale * event.calculateZoom()).coerceIn(1f, 8f)
+                                scale = next; offset = if (next == 1f) Offset.Zero else offset + event.calculatePan()
+                                event.changes.forEach { it.consume() }
+                            }
+                            if (event.changes.none { it.pressed }) break
+                        }
+                    }
+                }.graphicsLayer {
+                    scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y
+                }, contentScale = ContentScale.Fit
+            )
+        }
+        IconButton(onClick = onBack, modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))) {
+            Icon(Icons.Default.ArrowBack, "กลับ", tint = Color.White)
+        }
+        Text("${pagerState.currentPage + 1} / ${photos.size}", color = Color.White,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 22.dp)
+                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(16.dp)).padding(horizontal = 12.dp, vertical = 5.dp))
+        IconButton(onClick = { showInfo = true }, modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))) {
+            Icon(Icons.Default.Info, "ข้อมูลรูป", tint = Color.White)
+        }
+        Surface(Modifier.align(Alignment.BottomCenter).padding(16.dp), color = Color.Black.copy(alpha = 0.62f), shape = RoundedCornerShape(28.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { scale = (scale - 0.5f).coerceAtLeast(1f); if (scale == 1f) offset = Offset.Zero }) {
+                    Text("−", color = Color.White, style = MaterialTheme.typography.titleLarge)
+                }
+                Text("%.1f×".format(scale), color = Color.White, modifier = Modifier.width(52.dp))
+                IconButton(onClick = { scale = (scale + 0.5f).coerceAtMost(8f) }) { Text("+", color = Color.White, style = MaterialTheme.typography.titleLarge) }
+                TextButton(onClick = { scale = 1f; offset = Offset.Zero }) { Text("รีเซ็ต", color = Color.White) }
+            }
+        }
+    }
+    if (showInfo) AlertDialog(
+        onDismissRequest = { if (!downloading) showInfo = false }, title = { Text("ข้อมูลรูปบน Server") },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("ชื่อไฟล์: ${photo.filename}"); Text("โฟลเดอร์: ${photo.locationName.ifBlank { "โฟลเดอร์หลัก" }}")
+            Text("ถ่ายเมื่อ: ${displayDateTime(photo.capturedAt)}")
+            if (photo.latitude != null) Text("GPS: ${photo.latitude}, ${photo.longitude}\nความแม่นยำ: ±${photo.accuracy ?: 0f} เมตร") else Text("GPS: ไม่มีข้อมูล")
+        } },
+        confirmButton = { Button(onClick = {
+            downloading = true; scope.launch {
+                runCatching { repo.restoreCloudPhoto(serverUrl, photo) }
+                    .onSuccess { Toast.makeText(context, "ดาวน์โหลดกลับเข้า DN แล้ว", Toast.LENGTH_LONG).show(); showInfo = false }
+                    .onFailure { Toast.makeText(context, "ดาวน์โหลดไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                downloading = false
+            }
+        }, enabled = !downloading) { Icon(Icons.Default.CloudDownload, null); Spacer(Modifier.width(6.dp)); Text(if (downloading) "กำลังดาวน์โหลด…" else "ดาวน์โหลดกลับ") } },
+        dismissButton = { TextButton(onClick = { showInfo = false }, enabled = !downloading) { Text("ปิด") } }
+    )
+}
+
+@Composable private fun CloudPhotosPage(
+    repo: PhotoRepository, serverUrl: String, jobId: String, clientName: String, jobName: String,
+    openPdf: (CloudDocument) -> Unit, openPhoto: (List<CloudPhoto>, Int) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var catalog by remember { mutableStateOf(CloudCatalog()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var selected by remember { mutableStateOf<CloudPhoto?>(null) }
+    var downloading by remember { mutableStateOf<String?>(null) }
+    var downloaded by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var currentFolder by remember { mutableStateOf("") }
+    var selectedNote by remember { mutableStateOf<com.fieldphoto.app.sync.CloudNote?>(null) }
+    var confirmRestoreGroup by remember { mutableStateOf(false) }
+    var restoringGroup by remember { mutableStateOf(false) }
+    LaunchedEffect(serverUrl, clientName, jobName) {
+        loading = true
+        runCatching { CloudClient().catalog(serverUrl) }
+            .onSuccess { full ->
+                catalog = CloudCatalog(
+                    full.folders.filter { if (jobId.isNotBlank()) it.jobId == jobId else it.clientName == clientName && it.jobName == jobName },
+                    full.photos.filter { if (jobId.isNotBlank()) it.jobId == jobId else it.clientName == clientName && it.jobName == jobName },
+                    full.documents.filter { if (jobId.isNotBlank()) it.jobId == jobId else it.clientName == clientName && it.jobName == jobName },
+                    full.notes.filter { if (jobId.isNotBlank()) it.jobId == jobId else it.clientName == clientName && it.jobName == jobName },
+                ); error = null
+            }
+            .onFailure { error = it.message ?: "เชื่อมต่อ Server ไม่ได้" }
+        loading = false
+    }
+    val prefix = if (currentFolder.isBlank()) "" else "$currentFolder/"
+    val childFolders = catalog.folders.filter { folder ->
+        folder.locationName.startsWith(prefix) && folder.locationName != currentFolder &&
+            !folder.locationName.removePrefix(prefix).contains('/')
+    }.distinctBy { it.locationName }
+    val visiblePhotos = catalog.photos.filter { it.locationName == currentFolder }
+    val visibleDocuments = catalog.documents.filter { it.locationName == currentFolder }
+    val visibleNotes = catalog.notes.filter { it.locationName == currentFolder }
+    BackHandler(enabled = currentFolder.isNotBlank()) { currentFolder = currentFolder.substringBeforeLast('/', "") }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (currentFolder.isNotBlank()) IconButton(onClick = { currentFolder = currentFolder.substringBeforeLast('/', "") }) {
+                Icon(Icons.Default.ArrowBack, "โฟลเดอร์ก่อนหน้า")
+            }
+            Icon(Icons.Default.Cloud, null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(8.dp))
+            Text(currentFolder.ifBlank { "โฟลเดอร์หลักบน Server" }, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            FilledTonalIconButton(onClick = { confirmRestoreGroup = true }) {
+                Icon(Icons.Default.CloudDownload, if (currentFolder.isBlank()) "ดาวน์โหลดทั้งงาน" else "ดาวน์โหลดทั้งโฟลเดอร์")
+            }
+        }
+        when {
+            loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            error != null -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) { Text(error!!, color = MaterialTheme.colorScheme.error) }
+            catalog.folders.isEmpty() && catalog.photos.isEmpty() && catalog.documents.isEmpty() && catalog.notes.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("ไม่พบข้อมูลบน Server") }
+            else -> LazyVerticalGrid(
+                columns = GridCells.Fixed(2), contentPadding = PaddingValues(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                gridItems(childFolders, key = { "folder-${it.locationName}" }, span = { GridItemSpan(maxLineSpan) }) { folder ->
+                    Surface(Modifier.fillMaxWidth().clickable { currentFolder = folder.locationName }, shape = RoundedCornerShape(14.dp), color = Color.LightGray.copy(alpha = 0.48f)) {
+                        Row(Modifier.padding(14.dp).graphicsLayer(alpha = 0.76f), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CloudQueue, null); Spacer(Modifier.width(10.dp))
+                            Text(folder.locationName.ifBlank { "โฟลเดอร์หลัก" }, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+                gridItems(visibleNotes, key = { "note-${it.id}" }, span = { GridItemSpan(maxLineSpan) }) { note ->
+                    Surface(Modifier.fillMaxWidth().clickable { selectedNote = note }, shape = RoundedCornerShape(14.dp), color = Color.LightGray.copy(alpha = 0.48f)) {
+                        Row(Modifier.padding(14.dp).graphicsLayer(alpha = 0.76f), verticalAlignment = Alignment.Top) {
+                            Icon(Icons.Default.Cloud, null); Spacer(Modifier.width(10.dp)); Column {
+                                Text(note.title, fontWeight = FontWeight.Bold); Text(note.content, maxLines = 5)
+                                Text(displayDateTime(note.updatedAt), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                }
+                gridItems(visibleDocuments, key = { "document-${it.id}" }, span = { GridItemSpan(maxLineSpan) }) { document ->
+                    Surface(
+                        Modifier.fillMaxWidth().clickable { openPdf(document) }, shape = RoundedCornerShape(14.dp), color = Color.LightGray.copy(alpha = 0.48f)
+                    ) {
+                        Row(Modifier.padding(14.dp).graphicsLayer(alpha = 0.76f), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.PictureAsPdf, null); Spacer(Modifier.width(10.dp)); Column {
+                                Text(document.filename, fontWeight = FontWeight.Bold)
+                                Text("PDF ${document.pageCount} หน้า • เปิดใน DN", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
+                gridItemsIndexed(visiblePhotos, key = { _, item -> item.hash }) { index, cloud ->
+                    ElevatedCard(
+                        Modifier.aspectRatio(1f).clickable { openPhoto(visiblePhotos, index) },
+                        colors = CardDefaults.elevatedCardColors(containerColor = Color.LightGray.copy(alpha = 0.58f))
+                    ) {
+                        Box(Modifier.fillMaxSize().graphicsLayer(alpha = 0.76f)) {
+                            AsyncImage(
+                                CloudClient().photoUrl(serverUrl, cloud.hash), cloud.filename,
+                                Modifier.fillMaxSize(), contentScale = ContentScale.Crop
+                            )
+                            Box(
+                                Modifier.align(Alignment.TopEnd).padding(7.dp).size(32.dp)
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.8f), RoundedCornerShape(50)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(if (cloud.hash in downloaded) Icons.Default.CloudDone else Icons.Default.Cloud,
+                                    "รูปบน Server", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (confirmRestoreGroup) AlertDialog(
+        onDismissRequest = { if (!restoringGroup) confirmRestoreGroup = false },
+        icon = { Icon(Icons.Default.CloudDownload, null) },
+        title = { Text(if (currentFolder.isBlank()) "ดาวน์โหลดทั้งงาน" else "ดาวน์โหลดทั้งโฟลเดอร์") },
+        text = { Text("ระบบจะนำโครงสร้างโฟลเดอร์ รูป PDF และโน้ตกลับเข้า DN หากชื่องานซ้ำจะสร้างชื่อแบบวงเล็บแยกให้อัตโนมัติ") },
+        confirmButton = { Button(onClick = {
+            restoringGroup = true
+            scope.launch {
+                runCatching { repo.restoreCloudGroup(serverUrl, catalog, currentFolder.takeIf { it.isNotBlank() }) }
+                    .onSuccess { count -> Toast.makeText(context, "ดาวน์โหลดกลับ $count รายการแล้ว", Toast.LENGTH_LONG).show(); confirmRestoreGroup = false }
+                    .onFailure { Toast.makeText(context, "ดาวน์โหลดไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                restoringGroup = false
+            }
+        }, enabled = !restoringGroup) { Text(if (restoringGroup) "กำลังดาวน์โหลด…" else "ดาวน์โหลด") } },
+        dismissButton = { TextButton(onClick = { confirmRestoreGroup = false }, enabled = !restoringGroup) { Text("ยกเลิก") } }
+    )
+    selectedNote?.let { note ->
+        AlertDialog(
+            onDismissRequest = { selectedNote = null }, icon = { Icon(Icons.Default.Cloud, null) },
+            title = { Text(note.title) },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(note.content); HorizontalDivider(); Text("แก้ไขล่าสุด ${displayDateTime(note.updatedAt)}", style = MaterialTheme.typography.bodySmall)
+            } },
+            confirmButton = { TextButton(onClick = { selectedNote = null }) { Text("ปิด") } }
+        )
+    }
+    selected?.let { cloud ->
+        AlertDialog(
+            onDismissRequest = { if (downloading == null) selected = null },
+            title = { Text(cloud.filename) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    AsyncImage(CloudClient().photoUrl(serverUrl, cloud.hash), cloud.filename,
+                        Modifier.fillMaxWidth().aspectRatio(1f).graphicsLayer(alpha = 0.9f), contentScale = ContentScale.Fit)
+                    Text("โฟลเดอร์: ${cloud.locationName.ifBlank { "โฟลเดอร์หลัก" }}")
+                    Text("ถ่ายเมื่อ: ${displayDateTime(cloud.capturedAt)}")
+                    Text("ไฟล์นี้อยู่บน Server${if (cloud.hash in downloaded) " และดาวน์โหลดลงมือถือแล้ว" else " เท่านั้น"}")
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    downloading = cloud.hash
+                    scope.launch {
+                        runCatching { repo.restoreCloudPhoto(serverUrl, cloud) }
+                            .onSuccess {
+                                downloaded = downloaded + cloud.hash
+                                Toast.makeText(context, "ดาวน์โหลดกลับเข้า DN แล้ว", Toast.LENGTH_LONG).show()
+                                selected = null
+                            }
+                            .onFailure { Toast.makeText(context, "ดาวน์โหลดไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                        downloading = null
+                    }
+                }, enabled = downloading == null && cloud.hash !in downloaded) {
+                    if (downloading == cloud.hash) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Default.CloudDownload, null)
+                    Spacer(Modifier.width(6.dp)); Text("ดาวน์โหลดกลับ")
+                }
+            },
+            dismissButton = { TextButton(onClick = { selected = null }, enabled = downloading == null) { Text("ปิด") } }
+        )
+    }
+}
+
+@Composable private fun CloudPdfPage(serverUrl: String, document: CloudDocument) {
+    val context = LocalContext.current
+    var pages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(serverUrl, document.id) {
+        loading = true
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val file = File(context.cacheDir, "cloud-${document.id}.pdf")
+                CloudClient().openDocument(serverUrl, document.id).use { response ->
+                    if (!response.isSuccessful) error("ดาวน์โหลด PDF ไม่สำเร็จ: Server ${response.code}")
+                    file.outputStream().use { output -> response.body?.byteStream().use { input -> requireNotNull(input); input.copyTo(output) } }
+                }
+                ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+                    PdfRenderer(descriptor).use { renderer ->
+                        (0 until renderer.pageCount).map { index ->
+                            renderer.openPage(index).use { page ->
+                                val width = page.width.coerceAtMost(1600)
+                                val height = (page.height * (width.toFloat() / page.width)).toInt()
+                                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+                                    bitmap.eraseColor(android.graphics.Color.WHITE)
+                                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }.onSuccess { pages = it; error = null }.onFailure { error = it.message ?: "เปิด PDF ไม่สำเร็จ" }
+        loading = false
+    }
+    when {
+        loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        error != null -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) { Text(error!!, color = MaterialTheme.colorScheme.error) }
+        else -> LazyColumn(
+            Modifier.fillMaxSize().background(Color(0xFFE7E7E7)), contentPadding = PaddingValues(10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            itemsIndexed(pages) { index, bitmap ->
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("หน้า ${index + 1}/${pages.size}", style = MaterialTheme.typography.labelSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Image(bitmap.asImageBitmap(), "PDF หน้า ${index + 1}", Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun SettingsPage(current: String, timestampEnabled: Boolean, saveUrl: (String) -> Unit, saveTimestamp: (Boolean) -> Unit) {

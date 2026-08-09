@@ -10,6 +10,11 @@ import android.provider.MediaStore
 import android.os.Environment
 import android.net.Uri
 import com.fieldphoto.app.media.MediaStoreManager
+import com.fieldphoto.app.sync.CloudClient
+import com.fieldphoto.app.sync.CloudPhoto
+import com.fieldphoto.app.sync.CloudCatalog
+import com.fieldphoto.app.sync.CloudDocument
+import com.fieldphoto.app.sync.CloudNote
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.OffsetDateTime
@@ -18,6 +23,107 @@ import java.util.UUID
 class PhotoRepository(private val context: Context, val dao: AppDao) {
     val media = MediaStoreManager(context)
     private fun now() = OffsetDateTime.now().toString()
+
+    suspend fun movePhotos(photoIds: List<String>, targetLocationId: String) = withContext(Dispatchers.IO) {
+        if (photoIds.isNotEmpty()) dao.movePhotos(photoIds, targetLocationId)
+    }
+
+    suspend fun moveFolder(source: LocationEntity, target: LocationEntity) = withContext(Dispatchers.IO) {
+        require(source.name.isNotBlank()) { "ย้ายโฟลเดอร์หลักทั้งงานไม่ได้" }
+        require(source.jobId != target.jobId || !target.name.startsWith("${source.name}/")) { "ย้ายเข้าโฟลเดอร์ย่อยของตัวเองไม่ได้" }
+        val sourceFolders = dao.folderTree(source.jobId, source.name, "${source.name}/%").sortedBy { it.name.length }
+        val baseName = source.name.substringAfterLast('/')
+        sourceFolders.forEach { old ->
+            val suffix = old.name.removePrefix(source.name).trimStart('/')
+            val newName = listOf(target.name, baseName, suffix).filter { it.isNotBlank() }.joinToString("/")
+            val destination = dao.locationByName(target.jobId, newName)
+                ?: LocationEntity(UUID.randomUUID().toString(), target.jobId, newName, now()).also { dao.insertLocation(it) }
+            val photos = dao.photosNow(old.id)
+            if (photos.isNotEmpty()) dao.movePhotos(photos.map { it.id }, destination.id)
+            dao.documentsNow(old.id).forEach { dao.moveDocument(it.id, destination.id) }
+            dao.notesNow(old.id).forEach { dao.moveNote(it.id, destination.id) }
+        }
+        sourceFolders.sortedByDescending { it.name.length }.forEach { dao.deleteLocation(it.id) }
+    }
+
+    private suspend fun cloudRestoreJob(jobId: String, clientName: String, jobName: String): JobEntity {
+        val key = if (jobId.isNotBlank()) jobId else "$clientName/$jobName"
+        val preferences = context.getSharedPreferences("cloud_restore_jobs", Context.MODE_PRIVATE)
+        preferences.getString(key, null)?.let { stored -> runCatching { return dao.job(stored) } }
+        val client = dao.clientByName(clientName) ?: ClientEntity(UUID.randomUUID().toString(), clientName, now()).also { dao.insertClient(it) }
+        val localName = uniqueJobName(client.id, jobName)
+        return JobEntity(UUID.randomUUID().toString(), client.id, localName, now()).also {
+            dao.insertJob(it); dao.insertLocation(LocationEntity(UUID.randomUUID().toString(), it.id, "", now()))
+            preferences.edit().putString(key, it.id).apply()
+        }
+    }
+
+    suspend fun restoreCloudPhoto(serverUrl: String, cloud: CloudPhoto): PhotoEntity = withContext(Dispatchers.IO) {
+        val job = cloudRestoreJob(cloud.jobId, cloud.clientName, cloud.jobName)
+        val client = dao.client(job.clientId)
+        val root = dao.locationByName(job.id, "") ?: LocationEntity(UUID.randomUUID().toString(), job.id, "", now()).also { dao.insertLocation(it) }
+        val location = if (cloud.locationName.isBlank()) root else dao.locationByName(job.id, cloud.locationName)
+            ?: LocationEntity(UUID.randomUUID().toString(), job.id, cloud.locationName, now()).also { dao.insertLocation(it) }
+        val capturedAt = OffsetDateTime.parse(cloud.capturedAt)
+        val (uri, relative, filename) = media.newDestination(client.name, job.name, location.name, capturedAt)
+        try {
+            CloudClient().openPhoto(serverUrl, cloud.hash).use { response ->
+                if (!response.isSuccessful) error("ดาวน์โหลดไม่สำเร็จ: Server ${response.code}")
+                context.contentResolver.openOutputStream(uri).use { output ->
+                    requireNotNull(output); response.body?.byteStream().use { input -> requireNotNull(input); input.copyTo(output) }
+                }
+            }
+            media.finish(uri)
+            check(media.sha256(uri) == cloud.hash) { "SHA-256 ของไฟล์ที่ดาวน์โหลดไม่ตรง" }
+            PhotoEntity(UUID.randomUUID().toString(), location.id, cloud.hash, uri.toString(), relative, filename,
+                cloud.capturedAt, cloud.latitude, cloud.longitude, cloud.accuracy, UploadStatus.UPLOADED).also { dao.insertPhoto(it) }
+        } catch (error: Throwable) {
+            media.cancel(uri)
+            throw error
+        }
+    }
+
+    private suspend fun restoreCloudNote(cloud: CloudNote) {
+        val job = cloudRestoreJob(cloud.jobId, cloud.clientName, cloud.jobName)
+        val location = dao.locationByName(job.id, cloud.locationName)
+            ?: LocationEntity(UUID.randomUUID().toString(), job.id, cloud.locationName, now()).also { dao.insertLocation(it) }
+        dao.insertNote(NoteEntity(UUID.randomUUID().toString(), location.id, cloud.title, cloud.content, cloud.updatedAt, UploadStatus.UPLOADED))
+    }
+
+    private suspend fun restoreCloudDocument(serverUrl: String, cloud: CloudDocument) {
+        val job = cloudRestoreJob(cloud.jobId, cloud.clientName, cloud.jobName); val client = dao.client(job.clientId)
+        val location = dao.locationByName(job.id, cloud.locationName)
+            ?: LocationEntity(UUID.randomUUID().toString(), job.id, cloud.locationName, now()).also { dao.insertLocation(it) }
+        val photoPath = media.relativePath(client.name, job.name, location.name)
+        val relative = "${Environment.DIRECTORY_DOWNLOADS}/${photoPath.substringAfter('/').trimStart('/')}"
+        val target = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, cloud.filename); put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relative); put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }) ?: error("สร้าง PDF ไม่สำเร็จ")
+        try {
+            CloudClient().openDocument(serverUrl, cloud.id).use { response ->
+                if (!response.isSuccessful) error("ดาวน์โหลด PDF ไม่สำเร็จ: ${response.code}")
+                context.contentResolver.openOutputStream(target).use { output -> response.body?.byteStream().use { input -> requireNotNull(output); requireNotNull(input); input.copyTo(output) } }
+            }
+            context.contentResolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            dao.insertDocument(DocumentEntity(UUID.randomUUID().toString(), location.id, target.toString(), cloud.filename,
+                media.sha256(target), cloud.pageCount, cloud.createdAt, UploadStatus.UPLOADED))
+        } catch (error: Throwable) { context.contentResolver.delete(target, null, null); throw error }
+    }
+
+    suspend fun restoreCloudGroup(serverUrl: String, catalog: CloudCatalog, folderPrefix: String?): Int = withContext(Dispatchers.IO) {
+        fun included(path: String) = folderPrefix == null || path == folderPrefix || path.startsWith("$folderPrefix/")
+        val folders = catalog.folders.filter { included(it.locationName) }
+        if (folders.isNotEmpty()) {
+            val first = folders.first(); val job = cloudRestoreJob(first.jobId, first.clientName, first.jobName)
+            folders.forEach { if (dao.locationByName(job.id, it.locationName) == null) dao.insertLocation(LocationEntity(UUID.randomUUID().toString(), job.id, it.locationName, now())) }
+        }
+        var count = 0
+        catalog.photos.filter { included(it.locationName) }.forEach { restoreCloudPhoto(serverUrl, it); count++ }
+        catalog.documents.filter { included(it.locationName) }.forEach { restoreCloudDocument(serverUrl, it); count++ }
+        catalog.notes.filter { included(it.locationName) }.forEach { restoreCloudNote(it); count++ }
+        count
+    }
 
     suspend fun addClient(name: String) { dao.insertClient(ClientEntity(UUID.randomUUID().toString(), name.trim(), now())) }
     suspend fun addJob(clientId: String, name: String) = dao.insertJob(JobEntity(UUID.randomUUID().toString(), clientId, name.trim(), now()))

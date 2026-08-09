@@ -112,6 +112,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
 
     private fun createFolder(base: String, folder: PendingFolder) {
         val json = JSONObject().apply {
+            put("job_id", folder.jobId)
             put("client_name", folder.clientName)
             put("job_name", folder.jobName)
             put("location_name", folder.locationName)
@@ -131,6 +132,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("document", document.filename, fileBody).addFormDataPart("document_id", document.id)
             .addFormDataPart("sha256", document.sha256).addFormDataPart("client_name", document.clientName)
+            .addFormDataPart("job_id", document.jobId)
             .addFormDataPart("job_name", document.jobName).addFormDataPart("location_name", document.locationName)
             .addFormDataPart("filename", document.filename).addFormDataPart("page_count", document.pageCount.toString())
             .addFormDataPart("created_at", document.createdAt).build()
@@ -141,6 +143,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
 
     private fun uploadNote(base: String, note: PendingNote) {
         val body = JSONObject().apply {
+            put("job_id", note.jobId)
             put("note_id", note.id); put("client_name", note.clientName); put("job_name", note.jobName)
             put("location_name", note.locationName); put("title", note.title); put("content", note.content); put("updated_at", note.updatedAt)
         }.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -163,6 +166,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("photo", p.filename, fileBody)
             .addFormDataPart("photo_id", p.id).addFormDataPart("sha256", p.sha256)
+            .addFormDataPart("job_id", p.jobId)
             .addFormDataPart("client_name", p.clientName).addFormDataPart("job_name", p.jobName)
             .addFormDataPart("location_name", p.locationName).addFormDataPart("filename", p.filename)
             .addFormDataPart("captured_at", p.capturedAt)

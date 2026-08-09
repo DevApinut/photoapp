@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 BASE_DIR = Path(os.getenv("PHOTO_SYNC_DATA", Path(__file__).parent / "data")).resolve()
@@ -53,6 +54,10 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute("CREATE TABLE IF NOT EXISTS backup_jobs (job_id TEXT PRIMARY KEY, client_name TEXT NOT NULL, requested_name TEXT NOT NULL, storage_name TEXT NOT NULL)")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(uploaded_photos)")}
+        if "job_id" not in columns:
+            connection.execute("ALTER TABLE uploaded_photos ADD COLUMN job_id TEXT")
         connection.commit()
 
 
@@ -75,12 +80,14 @@ class CheckRequest(BaseModel):
 
 
 class FolderRequest(BaseModel):
+    job_id: str | None = None
     client_name: str
     job_name: str
     location_name: str = ""
 
 
 class NoteRequest(BaseModel):
+    job_id: str | None = None
     note_id: str
     client_name: str
     job_name: str
@@ -90,11 +97,29 @@ class NoteRequest(BaseModel):
     updated_at: str
 
 
-def destination_dir(client_name: str, job_name: str, location_name: str) -> Path:
+def storage_job_name(client_name: str, job_name: str, job_id: str | None) -> str:
+    requested = safe_part(job_name)
+    if not job_id:
+        return requested
+    with closing(db()) as connection:
+        found = connection.execute("SELECT storage_name FROM backup_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if found: return found["storage_name"]
+        parent = PHOTO_ROOT if client_name.strip() == "งานทั่วไป" else PHOTO_ROOT / safe_part(client_name)
+        candidate = requested; number = 2
+        while (parent / candidate).exists() or connection.execute(
+            "SELECT 1 FROM backup_jobs WHERE client_name=? AND storage_name=?", (client_name, candidate)
+        ).fetchone():
+            candidate = f"{requested} ({number})"; number += 1
+        connection.execute("INSERT INTO backup_jobs VALUES (?,?,?,?)", (job_id, client_name, job_name, candidate)); connection.commit()
+        return candidate
+
+
+def destination_dir(client_name: str, job_name: str, location_name: str, job_id: str | None = None) -> Path:
+    stored_job = storage_job_name(client_name, job_name, job_id)
     if client_name.strip() == "งานทั่วไป":
-        target_dir = PHOTO_ROOT / safe_part(job_name)
+        target_dir = PHOTO_ROOT / stored_job
     else:
-        target_dir = PHOTO_ROOT / safe_part(client_name) / safe_part(job_name)
+        target_dir = PHOTO_ROOT / safe_part(client_name) / stored_job
     for folder_part in location_name.split("/"):
         if folder_part.strip():
             target_dir = target_dir / safe_part(folder_part)
@@ -115,6 +140,7 @@ def write_folder_info(
     location_name: str,
     photo_info: dict[str, object] | None = None,
     document_info: dict[str, object] | None = None,
+    job_id: str | None = None,
 ) -> None:
     info_path = target_dir / INFO_FILENAME
     document: dict[str, object] = {"photos": []}
@@ -131,6 +157,7 @@ def write_folder_info(
         "client": client_name,
         "job": job_name,
         "folder": location_name,
+        "job_id": job_id,
         "updated_at": datetime.now().astimezone().isoformat(),
     })
     photos = document.get("photos")
@@ -158,11 +185,91 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/catalog")
+def catalog() -> dict[str, list[dict[str, object]]]:
+    """List available backup folders, photos, documents and notes."""
+    with closing(db()) as connection:
+        rows = connection.execute("""
+            SELECT hash, job_id, client_name, job_name, location_name, filename, stored_path,
+                   captured_at, latitude, longitude, accuracy, size_bytes
+            FROM uploaded_photos ORDER BY captured_at DESC
+        """).fetchall()
+    photos = []
+    for row in rows:
+        stored = PHOTO_ROOT / row["stored_path"]
+        if stored.is_file():
+            photos.append({key: row[key] for key in (
+                "hash", "job_id", "client_name", "job_name", "location_name", "filename",
+                "captured_at", "latitude", "longitude", "accuracy", "size_bytes"
+            )})
+    folders: list[dict[str, object]] = []
+    documents: list[dict[str, object]] = []
+    notes: list[dict[str, object]] = []
+    for info_path in PHOTO_ROOT.rglob(INFO_FILENAME):
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            if not isinstance(info, dict): continue
+            identity = {"job_id": info.get("job_id"), "client_name": str(info.get("client", "")), "job_name": str(info.get("job", "")),
+                        "location_name": str(info.get("folder", ""))}
+            folders.append(identity)
+            for document in info.get("documents", []):
+                if isinstance(document, dict) and (info_path.parent / str(document.get("filename", ""))).is_file():
+                    documents.append({**identity, **document})
+            notes_path = info_path.parent / "_DN_NOTES.json"
+            if notes_path.is_file():
+                loaded_notes = json.loads(notes_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_notes, list):
+                    notes.extend({**identity, **note} for note in loaded_notes if isinstance(note, dict))
+        except (OSError, ValueError):
+            continue
+    # Rebuild missing parent folders from every resource path so older backups still browse hierarchically.
+    known = {(str(item.get("job_id") or ""), item["client_name"], item["job_name"], item["location_name"]) for item in folders}
+    for item in [*photos, *documents, *notes]:
+        parts = [part for part in str(item.get("location_name", "")).split("/") if part]
+        for index in range(len(parts) + 1):
+            location = "/".join(parts[:index])
+            key = (str(item.get("job_id") or ""), str(item.get("client_name", "")), str(item.get("job_name", "")), location)
+            if key not in known:
+                folders.append({"job_id": key[0] or None, "client_name": key[1], "job_name": key[2], "location_name": location})
+                known.add(key)
+    return {"folders": folders, "photos": photos, "documents": documents, "notes": notes}
+
+
+@app.get("/photo/{photo_hash}")
+def download_photo(photo_hash: str) -> FileResponse:
+    normalized = photo_hash.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise HTTPException(400, "Invalid SHA-256")
+    with closing(db()) as connection:
+        row = connection.execute(
+            "SELECT filename, stored_path FROM uploaded_photos WHERE hash = ?", (normalized,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "Photo not found")
+    source = PHOTO_ROOT / row["stored_path"]
+    if not source.is_file():
+        raise HTTPException(404, "Backup file is no longer on this server")
+    return FileResponse(source, media_type="image/jpeg", filename=row["filename"])
+
+
+@app.get("/document/{document_id}")
+def download_document(document_id: str) -> FileResponse:
+    for info_path in PHOTO_ROOT.rglob(INFO_FILENAME):
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            for document in info.get("documents", []):
+                if isinstance(document, dict) and str(document.get("document_id")) == document_id:
+                    source = info_path.parent / safe_part(str(document.get("filename", "")))
+                    if source.is_file(): return FileResponse(source, media_type="application/pdf", filename=source.name)
+        except (OSError, ValueError): pass
+    raise HTTPException(404, "Document not found")
+
+
 @app.post("/folder")
 def create_folder(request: FolderRequest) -> dict[str, str]:
-    target = destination_dir(request.client_name, request.job_name, request.location_name)
+    target = destination_dir(request.client_name, request.job_name, request.location_name, request.job_id)
     target.mkdir(parents=True, exist_ok=True)
-    write_folder_info(target, request.client_name, request.job_name, request.location_name)
+    write_folder_info(target, request.client_name, request.job_name, request.location_name, job_id=request.job_id)
     return {"status": "ok", "path": str(target.relative_to(PHOTO_ROOT))}
 
 
@@ -184,10 +291,11 @@ async def upload_document(
     document: Annotated[UploadFile, File()], document_id: Annotated[str, Form()], sha256: Annotated[str, Form()],
     client_name: Annotated[str, Form()], job_name: Annotated[str, Form()], location_name: Annotated[str, Form()],
     filename: Annotated[str, Form()], page_count: Annotated[int, Form()], created_at: Annotated[str, Form()],
+    job_id: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
     expected = sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected): raise HTTPException(400, "Invalid SHA-256")
-    target_dir = destination_dir(client_name, job_name, location_name); target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = destination_dir(client_name, job_name, location_name, job_id); target_dir.mkdir(parents=True, exist_ok=True)
     target = available_target(target_dir, filename, expected)
     digest = hashlib.sha256(); size = 0
     fd, temp_name = tempfile.mkstemp(prefix=".document-", dir=target_dir); os.close(fd); temp = Path(temp_name)
@@ -199,7 +307,7 @@ async def upload_document(
         write_folder_info(target_dir, client_name, job_name, location_name, document_info={
             "document_id": document_id, "filename": target.name, "sha256": expected,
             "page_count": page_count, "created_at": created_at, "size_bytes": size,
-        })
+        }, job_id=job_id)
         return {"status": "uploaded", "sha256": expected, "size_bytes": size}
     finally:
         temp.unlink(missing_ok=True); await document.close()
@@ -207,7 +315,7 @@ async def upload_document(
 
 @app.post("/note")
 def save_note(request: NoteRequest) -> dict[str, str]:
-    target_dir = destination_dir(request.client_name, request.job_name, request.location_name); target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = destination_dir(request.client_name, request.job_name, request.location_name, request.job_id); target_dir.mkdir(parents=True, exist_ok=True)
     data_path = target_dir / "_DN_NOTES.json"
     notes: list[dict[str, str]] = []
     if data_path.is_file():
@@ -239,6 +347,7 @@ async def upload(
     latitude: Annotated[float | None, Form()] = None,
     longitude: Annotated[float | None, Form()] = None,
     accuracy: Annotated[float | None, Form()] = None,
+    job_id: Annotated[str | None, Form()] = None,
 ) -> dict[str, object]:
     expected = sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
@@ -248,7 +357,7 @@ async def upload(
     except ValueError as exc:
         raise HTTPException(400, "captured_at must be ISO-8601 with timezone") from exc
 
-    target_dir = destination_dir(client_name, job_name, location_name)
+    target_dir = destination_dir(client_name, job_name, location_name, job_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     with closing(db()) as connection:
@@ -267,7 +376,7 @@ async def upload(
                 "photo_id": photo_id, "filename": requested.name, "sha256": expected,
                 "captured_at": captured_at, "latitude": latitude, "longitude": longitude,
                 "accuracy": accuracy, "backup_status": "already_exists",
-            })
+            }, job_id=job_id)
             return {"status": "already_exists", "hash": expected}
         if found:
             connection.execute("DELETE FROM uploaded_photos WHERE hash = ?", (expected,))
@@ -295,19 +404,19 @@ async def upload(
                     """
                     INSERT INTO uploaded_photos
                     (hash, photo_id, client_name, job_name, location_name, filename,
-                     stored_path, captured_at, latitude, longitude, accuracy, size_bytes, uploaded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     stored_path, captured_at, latitude, longitude, accuracy, size_bytes, uploaded_at, job_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (expected, photo_id, client_name, job_name, location_name, target.name,
                      str(target.relative_to(PHOTO_ROOT)), captured_at, latitude, longitude,
-                     accuracy, size, datetime.now().astimezone().isoformat()),
+                     accuracy, size, datetime.now().astimezone().isoformat(), job_id),
                 )
                 connection.commit()
                 write_folder_info(target_dir, client_name, job_name, location_name, {
                     "photo_id": photo_id, "filename": target.name, "sha256": expected,
                     "captured_at": captured_at, "latitude": latitude, "longitude": longitude,
                     "accuracy": accuracy, "size_bytes": size, "backup_status": "uploaded",
-                })
+                }, job_id=job_id)
             except sqlite3.IntegrityError:
                 target.unlink(missing_ok=True)
                 return {"status": "already_exists", "hash": expected}
