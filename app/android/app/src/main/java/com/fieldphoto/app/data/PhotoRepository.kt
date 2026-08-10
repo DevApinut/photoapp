@@ -7,6 +7,8 @@ import android.content.ContentValues
 import android.app.RecoverableSecurityException
 import android.os.Build
 import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.graphics.pdf.PdfRenderer
 import android.os.Environment
 import android.net.Uri
 import com.fieldphoto.app.media.MediaStoreManager
@@ -349,8 +351,12 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
         val source = Uri.parse(photo.contentUri)
         val exif = media.readExif(source)
         val capturedAt = exif.capturedAt ?: OffsetDateTime.parse(photo.capturedAt)
+        val storedGpsIsValid = photo.latitude != null && photo.longitude != null &&
+            photo.latitude in -90.0..90.0 && photo.longitude in -180.0..180.0 &&
+            !(photo.latitude == 0.0 && photo.longitude == 0.0)
         createTimestampFromSource(photo.locationId, source, photo.filename, capturedAt,
-            exif.latitude ?: photo.latitude, exif.longitude ?: photo.longitude, photo.accuracy)
+            exif.latitude ?: photo.latitude?.takeIf { storedGpsIsValid },
+            exif.longitude ?: photo.longitude?.takeIf { storedGpsIsValid }, photo.accuracy)
     }
 
     suspend fun reconcileMissingPhotos(locationId: String): Int = withContext(Dispatchers.IO) {
@@ -437,6 +443,38 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
             dao.insertDocument(DocumentEntity(UUID.randomUUID().toString(), locationId, target.toString(), filename,
                 media.sha256(target), pageCount, now()))
         } catch (error: Throwable) { context.contentResolver.delete(target, null, null); throw error }
+    }
+
+    suspend fun importPdf(locationId: String, source: Uri) = withContext(Dispatchers.IO) {
+        val resolver = context.contentResolver
+        val originalName = resolver.query(source, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }?.trim()?.takeIf { it.endsWith(".pdf", ignoreCase = true) }
+            ?: "PDF_${OffsetDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.pdf"
+        val pageCount = resolver.openFileDescriptor(source, "r")?.use { descriptor ->
+            PdfRenderer(descriptor).use { it.pageCount }
+        } ?: error("อ่านไฟล์ PDF ไม่สำเร็จ")
+        val location = dao.location(locationId); val job = dao.job(location.jobId); val client = dao.client(job.clientId)
+        val appHierarchy = media.relativePath(client.name, job.name, location.name).substringAfter('/').trimStart('/')
+        val target = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, originalName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$appHierarchy")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }) ?: error("สร้างไฟล์ PDF ไม่สำเร็จ")
+        try {
+            resolver.openInputStream(source).use { input ->
+                requireNotNull(input) { "อ่านไฟล์ PDF ไม่สำเร็จ" }
+                resolver.openOutputStream(target).use { output -> requireNotNull(output); input.copyTo(output) }
+            }
+            resolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            dao.insertDocument(DocumentEntity(UUID.randomUUID().toString(), locationId, target.toString(), originalName,
+                media.sha256(target), pageCount, now()))
+            pageCount
+        } catch (error: Throwable) {
+            resolver.delete(target, null, null)
+            throw error
+        }
     }
 
     suspend fun addNote(locationId: String, title: String, content: String) = withContext(Dispatchers.IO) {

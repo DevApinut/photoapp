@@ -21,6 +21,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.IntentSenderRequest
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
@@ -29,10 +33,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -57,6 +63,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -65,6 +73,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Precision
+import coil.size.Size
 import com.fieldphoto.app.data.*
 import com.fieldphoto.app.sync.SyncClient
 import com.fieldphoto.app.sync.SyncProgress
@@ -74,6 +85,7 @@ import com.fieldphoto.app.sync.CloudCatalog
 import com.fieldphoto.app.sync.CloudDocument
 import com.fieldphoto.app.media.RecentImage
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
@@ -88,6 +100,7 @@ import java.time.ZoneId
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import org.json.JSONArray
+import kotlin.math.sign
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
@@ -124,12 +137,28 @@ private data class CloudJobSummary(val jobId: String, val clientName: String, va
 private enum class JobSortMode { LATEST_PHOTO, NAME, CREATED }
 private enum class JobDateFilter { CREATED, LAST_PHOTO }
 
+private fun templatePathPreview(raw: String): List<String> = raw.lines().flatMap { line ->
+    val parts = line.trim().trim('/').split('/').map { it.trim() }.filter { it.isNotBlank() }
+    parts.indices.map { index -> parts.take(index + 1).joinToString("/") }
+}.distinct()
+
 private fun displayDateTime(value: String?): String = value?.let {
     runCatching { OffsetDateTime.parse(it).format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")) }.getOrDefault(it)
 } ?: "ยังไม่มีรูป"
 
 private fun localDateOf(value: String?): LocalDate? = value?.let {
     runCatching { OffsetDateTime.parse(it).toLocalDate() }.getOrNull()
+}
+
+private fun constrainedImageOffset(offset: Offset, scale: Float, viewport: IntSize, content: IntSize): Offset {
+    if (scale <= 1f || viewport.width <= 0 || viewport.height <= 0 || content.width <= 0 || content.height <= 0) return Offset.Zero
+    val imageRatio = content.width.toFloat() / content.height
+    val viewportRatio = viewport.width.toFloat() / viewport.height
+    val fittedWidth = if (imageRatio > viewportRatio) viewport.width.toFloat() else viewport.height * imageRatio
+    val fittedHeight = if (imageRatio > viewportRatio) viewport.width / imageRatio else viewport.height.toFloat()
+    val maxX = ((fittedWidth * scale - viewport.width) / 2f).coerceAtLeast(0f)
+    val maxY = ((fittedHeight * scale - viewport.height) / 2f).coerceAtLeast(0f)
+    return Offset(offset.x.coerceIn(-maxX, maxX), offset.y.coerceIn(-maxY, maxY))
 }
 
 private fun loadFolderTemplates(context: Context): List<FolderTemplate> = runCatching {
@@ -673,11 +702,8 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 templates.forEach { template ->
                     FilledTonalButton(onClick = {
                         createMenu = false
-                        scope.launch {
-                            runCatching { repo.createQuickJobFromTemplate(template.name, template.folders) }
-                                .onSuccess { (root, name) -> openJob(root, name) }
-                                .onFailure { Toast.makeText(context, "สร้างงานไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
-                        }
+                        selectedTemplate = template
+                        quickDialog = true
                     }, Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.FolderCopy, null); Text(" ใช้ Template: ${template.name}")
                     }
@@ -694,16 +720,17 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
         dismissButton = { TextButton(onClick = { createMenu = false }) { Text("ยกเลิก") } }
     )
     if (quickDialog) NameDialog(
-        if (selectedTemplate == null) "กรอกชื่องาน" else "ชื่องาน — ${selectedTemplate!!.name}",
+        if (selectedTemplate == null) "กรอกชื่องาน" else "ชื่องานใหม่ — ${selectedTemplate!!.name}",
+        initialValue = selectedTemplate?.name.orEmpty(),
+        confirmLabel = "สร้างงาน",
         onDismiss = { quickDialog = false }
     ) { value ->
         val template = selectedTemplate
         scope.launch {
             runCatching {
-                val root = repo.createQuickJob(value)
-                repo.applyFolderTemplate(root, template?.folders.orEmpty())
-                root
-            }.onSuccess { openJob(it, value) }
+                if (template == null) repo.createQuickJob(value) to value
+                else repo.createQuickJobFromTemplate(value.ifBlank { template.name }, template.folders)
+            }.onSuccess { (root, actualName) -> openJob(root, actualName) }
                 .onFailure { Toast.makeText(context, "สร้างงานไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
         }
         quickDialog = false
@@ -770,10 +797,28 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 OutlinedTextField(templateName, { templateName = it }, label = { Text("ชื่อ Template") }, singleLine = true)
                 OutlinedTextField(
                     templateFolders, { templateFolders = it },
-                    label = { Text("ชื่อโฟลเดอร์ย่อย — หนึ่งบรรทัดต่อหนึ่งโฟลเดอร์") },
-                    placeholder = { Text("จุดที่ 1\nจุดที่ 2\nเอกสาร/ก่อนทำงาน") },
+                    label = { Text("โครงสร้างโฟลเดอร์ — หนึ่ง path ต่อบรรทัด") },
+                    placeholder = { Text("จุดที่ 1/ก่อนทำ/ตู้ไฟ 1\nจุดที่ 1/ก่อนทำ/ตู้ไฟ 2\nจุดที่ 1/ก่อนทำ/ตู้ไฟ 3") },
                     modifier = Modifier.heightIn(min = 120.dp)
                 )
+                Text("ใช้เครื่องหมาย / คั่นแต่ละระดับ ไม่ต้องพิมพ์โฟลเดอร์แม่ซ้ำ ระบบสร้างให้เอง", style = MaterialTheme.typography.bodySmall)
+                Text("ถ้ามีหลายโฟลเดอร์ในแม่เดียวกัน ให้เขียน path เต็มแยกคนละบรรทัด เช่น ก่อนทำ/ตู้ไฟ 1 และ ก่อนทำ/ตู้ไฟ 2", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                val preview = templatePathPreview(templateFolders)
+                if (preview.isNotEmpty()) Surface(
+                    modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text("ตัวอย่างโครงสร้างที่จะสร้าง", fontWeight = FontWeight.Bold)
+                        preview.forEach { path ->
+                            val depth = path.count { it == '/' }
+                            Row(Modifier.padding(start = (depth * 18).dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Folder, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.width(6.dp)); Text(path.substringAfterLast('/'), style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
@@ -906,10 +951,13 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     if (dialog) NameDialog(addLabel, onDismiss = { dialog = false }) { value -> scope.launch { add(value) }; dialog = false }
 }
 
-@Composable private fun NameDialog(title: String, onDismiss: () -> Unit, save: (String) -> Unit) {
-    var value by remember { mutableStateOf("") }
+@Composable private fun NameDialog(title: String, initialValue: String = "", confirmLabel: String = "บันทึก", onDismiss: () -> Unit, save: (String) -> Unit) {
+    var value by remember(initialValue) { mutableStateOf(initialValue) }
     AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { OutlinedTextField(value, { value = it }, singleLine = true) },
-        confirmButton = { TextButton(onClick = { if (value.isNotBlank()) save(value.trim()) }, enabled = value.isNotBlank()) { Text("บันทึก") } },
+        confirmButton = { TextButton(
+            onClick = { if (value.isNotBlank() || initialValue.isNotBlank()) save(value.trim().ifBlank { initialValue }) },
+            enabled = value.isNotBlank() || initialValue.isNotBlank()
+        ) { Text(confirmLabel) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("ยกเลิก") } })
 }
 
@@ -942,6 +990,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val recoveryPreferences = remember { context.getSharedPreferences("settings", Context.MODE_PRIVATE) }
     var gridColumns by remember { mutableIntStateOf(displayPreferences.getInt("columns", 2).coerceIn(1, 5)) }
     var selectedPhotoIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var selectedDocumentIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var documentToDelete by remember { mutableStateOf<DocumentEntity?>(null) }
     var photosAwaitingDeleteApproval by remember { mutableStateOf<List<PhotoEntity>>(emptyList()) }
     var photoDeleteOptions by remember { mutableStateOf<PhotoEntity?>(null) }
     var showSelectedDeleteOptions by remember { mutableStateOf(false) }
@@ -957,10 +1007,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var movePhotoIds by remember { mutableStateOf<List<String>>(emptyList()) }
     var moveFolderSource by remember { mutableStateOf<LocationEntity?>(null) }
     var moveTargets by remember { mutableStateOf<List<MoveTarget>>(emptyList()) }
+    var moveBrowseJobId by remember { mutableStateOf<String?>(null) }
+    var moveBrowsePath by remember { mutableStateOf("") }
     var showMoveDialog by remember { mutableStateOf(false) }
     val selectedPhotos = rows.filter { it.id in selectedPhotoIds }
     LaunchedEffect(rows) {
         selectedPhotoIds = selectedPhotoIds.intersect(rows.mapTo(mutableSetOf()) { it.id })
+    }
+    LaunchedEffect(documents) {
+        selectedDocumentIds = selectedDocumentIds.intersect(documents.mapTo(mutableSetOf()) { it.id })
     }
     val batchDeleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val photos = photosAwaitingDeleteApproval
@@ -983,6 +1038,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             moveTargets = repo.dao.allLocationsNow().mapNotNull { location -> jobs[location.jobId]?.let { MoveTarget(it, location) } }
             movePhotoIds = photos
             moveFolderSource = folder
+            moveBrowseJobId = null
+            moveBrowsePath = ""
             showMoveDialog = true
         }
     }
@@ -999,6 +1056,22 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
         context.startActivity(Intent.createChooser(share, "แชร์ ${uris.size} รูป"))
+    }
+
+    fun shareSelectedDocuments() {
+        val selected = documents.filter { it.id in selectedDocumentIds }
+        val uris = ArrayList(selected.map { Uri.parse(it.contentUri) })
+        if (uris.isEmpty()) return
+        val share = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "application/pdf"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            clipData = ClipData.newUri(context.contentResolver, selected.first().filename, uris.first()).also { clips ->
+                uris.drop(1).forEach { clips.addItem(ClipData.Item(it)) }
+            }
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { context.startActivity(Intent.createChooser(share, "แชร์ PDF ${uris.size} ไฟล์")) }
+            .onFailure { Toast.makeText(context, "ไม่พบแอปที่รองรับการแชร์ PDF หลายไฟล์", Toast.LENGTH_LONG).show() }
     }
 
     fun deleteSelectedPhotosFromDevice() {
@@ -1071,6 +1144,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
     }
+    val pdfImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let {
+            scope.launch {
+                runCatching { repo.importPdf(place.id, it) }
+                    .onSuccess { pages -> Toast.makeText(context, "นำเข้า PDF $pages หน้าแล้ว", Toast.LENGTH_LONG).show() }
+                    .onFailure { error -> Toast.makeText(context, "นำเข้า PDF ไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
     fun startDocumentScanner() {
         val activity = context as? Activity ?: return
         documentScanner.getStartScanIntent(activity)
@@ -1138,8 +1220,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            LocationServices.getFusedLocationProviderClient(context).lastLocation
-                .addOnCompleteListener { task -> task.result?.let { save(it.latitude, it.longitude, it.accuracy) } ?: save(null, null, null) }
+            LocationServices.getFusedLocationProviderClient(context)
+                .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                .addOnCompleteListener { task ->
+                    val current = task.result?.takeIf {
+                        it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 &&
+                            !(it.latitude == 0.0 && it.longitude == 0.0)
+                    }
+                    current?.let { save(it.latitude, it.longitude, it.accuracy) } ?: save(null, null, null)
+                }
         } else save(null, null, null)
     }
 
@@ -1186,8 +1275,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
         if (useCurrentLocation && ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            LocationServices.getFusedLocationProviderClient(context).lastLocation
-                .addOnCompleteListener { task -> task.result?.let { importAll(it.latitude, it.longitude, it.accuracy) } ?: importAll(null, null, null) }
+            LocationServices.getFusedLocationProviderClient(context)
+                .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                .addOnCompleteListener { task ->
+                    val current = task.result?.takeIf {
+                        it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 &&
+                            !(it.latitude == 0.0 && it.longitude == 0.0)
+                    }
+                    current?.let { importAll(it.latitude, it.longitude, it.accuracy) } ?: importAll(null, null, null)
+                }
         } else importAll(null, null, null)
     }
 
@@ -1261,7 +1357,16 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         else Toast.makeText(context, "ต้องอนุญาตกล้องก่อน", Toast.LENGTH_SHORT).show()
     }
     Column(Modifier.fillMaxSize()) {
-        if (selectedPhotoIds.isNotEmpty()) {
+        if (selectedDocumentIds.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = { selectedDocumentIds = emptySet() }) { Icon(Icons.Default.Close, "ยกเลิก") }
+                Text("เลือกแล้ว ${selectedDocumentIds.size} PDF", Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                IconButton(onClick = ::shareSelectedDocuments) { Icon(Icons.Default.Share, "แชร์ PDF ที่เลือก") }
+            }
+        } else if (selectedPhotoIds.isNotEmpty()) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1312,22 +1417,51 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 }
             }
             gridItems(documents, key = { "document-${it.id}" }, span = { GridItemSpan(maxLineSpan) }) { document ->
-                ElevatedCard(Modifier.fillMaxWidth().clickable {
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(Uri.parse(document.contentUri), "application/pdf")
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                val isSelected = document.id in selectedDocumentIds
+                ElevatedCard(Modifier.fillMaxWidth().combinedClickable(
+                    onClick = {
+                        if (selectedDocumentIds.isNotEmpty()) {
+                            selectedDocumentIds = if (isSelected) selectedDocumentIds - document.id else selectedDocumentIds + document.id
+                        } else {
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(Uri.parse(document.contentUri), "application/pdf")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            runCatching { context.startActivity(intent) }
+                                .onFailure { Toast.makeText(context, "ไม่พบแอปเปิด PDF", Toast.LENGTH_SHORT).show() }
+                        }
+                    },
+                    onLongClick = {
+                        selectedPhotoIds = emptySet()
+                        selectedDocumentIds = selectedDocumentIds + document.id
                     }
-                    runCatching { context.startActivity(intent) }
-                        .onFailure { Toast.makeText(context, "ไม่พบแอปเปิด PDF", Toast.LENGTH_SHORT).show() }
-                }) {
-                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                )) {
+                    Row(
+                        Modifier.fillMaxWidth().background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent).padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (isSelected) {
+                            Icon(Icons.Default.CheckCircle, "เลือกแล้ว", tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(8.dp))
+                        }
                         Icon(Icons.Default.PictureAsPdf, null, tint = MaterialTheme.colorScheme.error)
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(document.filename, fontWeight = FontWeight.Bold)
                             Text("PDF ${document.pageCount} หน้า • ${document.status}", style = MaterialTheme.typography.bodySmall)
                         }
-                        IconButton(onClick = { scope.launch { repo.removeDocument(document) } }) { Icon(Icons.Default.Delete, "ลบ PDF") }
+                        if (selectedDocumentIds.isEmpty()) IconButton(onClick = {
+                            val uri = Uri.parse(document.contentUri)
+                            val share = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/pdf"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                clipData = ClipData.newUri(context.contentResolver, document.filename, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            runCatching { context.startActivity(Intent.createChooser(share, "แชร์ ${document.filename}")) }
+                                .onFailure { Toast.makeText(context, "ไม่พบแอปสำหรับแชร์ PDF", Toast.LENGTH_SHORT).show() }
+                        }) { Icon(Icons.Default.Share, "แชร์ PDF") }
+                        if (selectedDocumentIds.isEmpty()) IconButton(onClick = { documentToDelete = document }) { Icon(Icons.Default.Delete, "ลบ PDF") }
                     }
                 }
             }
@@ -1433,6 +1567,12 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     Text("สแกน PDF", style = MaterialTheme.typography.labelSmall)
                 }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledTonalIconButton(onClick = { pdfImportLauncher.launch(arrayOf("application/pdf")) }, modifier = Modifier.size(44.dp)) {
+                        Icon(Icons.Default.UploadFile, null, Modifier.size(22.dp))
+                    }
+                    Text("นำเข้า PDF", style = MaterialTheme.typography.labelSmall)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     FilledTonalIconButton(onClick = {
                         editingNote = null
                         noteTitle = ""
@@ -1447,47 +1587,117 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
           }
         }
     }
-    if (showMoveDialog) AlertDialog(
-        onDismissRequest = { showMoveDialog = false },
-        icon = { Icon(Icons.Default.DriveFileMove, null) },
-        title = { Text(if (moveFolderSource == null) "ย้าย ${movePhotoIds.size} รูป" else "ย้ายโฟลเดอร์ ${moveFolderSource?.name?.substringAfterLast('/')}") },
-        text = {
-            Column {
-                Text("เลือกงานและโฟลเดอร์ปลายทาง", style = MaterialTheme.typography.bodyMedium)
-                Spacer(Modifier.height(10.dp))
-                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 430.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(moveTargets, key = { "${it.job.id}-${it.location.id}" }) { target ->
-                        Surface(
-                            modifier = Modifier.fillMaxWidth().clickable {
-                                scope.launch {
-                                    runCatching {
-                                        moveFolderSource?.let { repo.moveFolder(it, target.location) }
-                                            ?: repo.movePhotos(movePhotoIds, target.location.id)
-                                    }.onSuccess {
-                                        selectedPhotoIds = emptySet()
-                                        showMoveDialog = false
-                                        Toast.makeText(context, "ย้ายไป ${target.job.name} แล้ว", Toast.LENGTH_LONG).show()
-                                    }.onFailure { Toast.makeText(context, "ย้ายไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+    documentToDelete?.let { document ->
+        AlertDialog(
+            onDismissRequest = { documentToDelete = null },
+            icon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("ลบ PDF นี้?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(document.filename, fontWeight = FontWeight.Bold)
+                    Text("PDF ${document.pageCount} หน้า")
+                    if (document.status != UploadStatus.UPLOADED) {
+                        Text("ไฟล์นี้ยัง Backup ไม่สำเร็จ", color = MaterialTheme.colorScheme.error)
+                    }
+                    Text("ไฟล์จะถูกลบออกจาก DN และพื้นที่เก็บเอกสารในมือถือ")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        documentToDelete = null
+                        scope.launch {
+                            runCatching { repo.removeDocument(document) }
+                                .onFailure { Toast.makeText(context, "ลบ PDF ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("ลบ PDF") }
+            },
+            dismissButton = { TextButton(onClick = { documentToDelete = null }) { Text("ยกเลิก") } }
+        )
+    }
+    fun movePickerBack() {
+        if (moveBrowseJobId == null) showMoveDialog = false
+        else if (moveBrowsePath.isBlank()) moveBrowseJobId = null
+        else moveBrowsePath = moveBrowsePath.substringBeforeLast('/', "")
+    }
+    BackHandler(enabled = showMoveDialog) { movePickerBack() }
+    if (showMoveDialog) {
+        val browseJob = moveBrowseJobId?.let { id -> moveTargets.firstOrNull { it.job.id == id }?.job }
+        val currentTarget = moveBrowseJobId?.let { jobId ->
+            moveTargets.firstOrNull { it.job.id == jobId && it.location.name == moveBrowsePath }
+        }
+        val jobs = moveTargets.map { it.job }.distinctBy { it.id }.sortedBy { it.name.lowercase() }
+        val children = moveBrowseJobId?.let { jobId ->
+            val prefix = if (moveBrowsePath.isBlank()) "" else "$moveBrowsePath/"
+            moveTargets.filter { target ->
+                target.job.id == jobId && target.location.name.startsWith(prefix) &&
+                    target.location.name != moveBrowsePath &&
+                    !target.location.name.removePrefix(prefix).contains('/')
+            }.sortedBy { it.location.name.lowercase() }
+        }.orEmpty()
+        AlertDialog(
+            onDismissRequest = { showMoveDialog = false },
+            icon = { Icon(Icons.Default.DriveFileMove, null) },
+            title = { Text(if (moveFolderSource == null) "ย้าย ${movePhotoIds.size} รูป" else "ย้ายโฟลเดอร์ ${moveFolderSource?.name?.substringAfterLast('/')}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = ::movePickerBack) { Icon(Icons.Default.ArrowBack, "ย้อนกลับ") }
+                        Column {
+                            Text(browseJob?.name ?: "เลือกงานปลายทาง", fontWeight = FontWeight.Bold)
+                            if (browseJob != null) Text(
+                                moveBrowsePath.ifBlank { "โฟลเดอร์หลัก" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 390.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (moveBrowseJobId == null) items(jobs, key = { it.id }) { job ->
+                            ElevatedCard(Modifier.fillMaxWidth().clickable {
+                                moveBrowseJobId = job.id; moveBrowsePath = ""
+                            }) {
+                                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Work, null); Spacer(Modifier.width(10.dp))
+                                    Text(job.name, Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                                    Icon(Icons.Default.ChevronRight, null)
                                 }
-                            },
-                            shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh
-                        ) {
-                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.Folder, null)
-                                Spacer(Modifier.width(10.dp))
-                                Column {
-                                    Text(target.job.name, fontWeight = FontWeight.Bold)
-                                    Text(target.location.name.ifBlank { "โฟลเดอร์หลัก" }, style = MaterialTheme.typography.bodySmall)
+                            }
+                        } else items(children, key = { it.location.id }) { target ->
+                            ElevatedCard(Modifier.fillMaxWidth().clickable { moveBrowsePath = target.location.name }) {
+                                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Folder, null); Spacer(Modifier.width(10.dp))
+                                    Text(target.location.name.substringAfterLast('/'), Modifier.weight(1f))
+                                    Icon(Icons.Default.ChevronRight, null)
                                 }
                             }
                         }
+                        if (moveBrowseJobId != null && children.isEmpty()) item {
+                            Text("ไม่มีโฟลเดอร์ย่อย", Modifier.fillMaxWidth().padding(20.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
+                    Text("เข้าไปยังตำแหน่งที่ต้องการ แล้วกด “ย้ายมาที่นี่”", style = MaterialTheme.typography.bodySmall)
                 }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = { showMoveDialog = false }) { Text("ยกเลิก") } }
-    )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val target = currentTarget ?: return@Button
+                    scope.launch {
+                        runCatching {
+                            moveFolderSource?.let { repo.moveFolder(it, target.location) }
+                                ?: repo.movePhotos(movePhotoIds, target.location.id)
+                        }.onSuccess {
+                            selectedPhotoIds = emptySet(); showMoveDialog = false
+                            Toast.makeText(context, "ย้ายไป ${target.job.name} / ${target.location.name.ifBlank { "โฟลเดอร์หลัก" }} แล้ว", Toast.LENGTH_LONG).show()
+                        }.onFailure { Toast.makeText(context, "ย้ายไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                    }
+                }, enabled = currentTarget != null) { Text("ย้ายมาที่นี่") }
+            },
+            dismissButton = { TextButton(onClick = { showMoveDialog = false }) { Text("ยกเลิก") } }
+        )
+    }
     if (noteDialog) AlertDialog(
         onDismissRequest = { noteDialog = false; editingNote = null },
         title = { Text(if (editingNote == null) "เพิ่มโน้ต" else "แก้ไขโน้ต") },
@@ -1695,8 +1905,11 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val photo = photos[pagerState.currentPage]
     var imageScale by remember { mutableFloatStateOf(1f) }
     var imageOffset by remember { mutableStateOf(Offset.Zero) }
+    var imageViewport by remember { mutableStateOf(IntSize.Zero) }
+    var imageContent by remember { mutableStateOf(IntSize.Zero) }
+    var edgePreview by remember { mutableFloatStateOf(0f) }
     var showInfo by remember { mutableStateOf(false) }
-    LaunchedEffect(pagerState.currentPage) { imageScale = 1f; imageOffset = Offset.Zero; showInfo = false }
+    LaunchedEffect(pagerState.currentPage) { imageScale = 1f; imageOffset = Offset.Zero; edgePreview = 0f; showInfo = false }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         scope.launch {
             delay(1000)
@@ -1707,22 +1920,76 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         HorizontalPager(state = pagerState, userScrollEnabled = imageScale == 1f, modifier = Modifier.fillMaxSize()) { page ->
             val pagePhoto = photos[page]
+            val originalRequest = remember(pagePhoto.contentUri) {
+                ImageRequest.Builder(context)
+                    .data(Uri.parse(pagePhoto.contentUri))
+                    .size(Size.ORIGINAL)
+                    .precision(Precision.EXACT)
+                    .crossfade(false)
+                    .build()
+            }
+            Box(Modifier.fillMaxSize().graphicsLayer { translationX = edgePreview }) {
             AsyncImage(
-                Uri.parse(pagePhoto.contentUri), pagePhoto.filename,
-                Modifier.fillMaxSize()
+                originalRequest, pagePhoto.filename,
+                onSuccess = { state ->
+                    val size = state.painter.intrinsicSize
+                    imageContent = IntSize(size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
+                },
+                modifier = Modifier.fillMaxSize()
+                    .onSizeChanged { imageViewport = it }
+                    .pointerInput(pagePhoto.id) {
+                        detectTapGestures(onDoubleTap = {
+                            imageScale = if (imageScale > 1f) 1f else 2.5f
+                            imageOffset = Offset.Zero
+                        })
+                    }
                     .pointerInput(pagePhoto.id) {
                         awaitEachGesture {
                             awaitFirstDown(requireUnconsumed = false)
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val pressedCount = event.changes.count { it.pressed }
-                                if (pressedCount >= 2 || imageScale > 1f) {
-                                    val nextScale = (imageScale * event.calculateZoom()).coerceIn(1f, 8f)
+                                val pan = event.calculatePan()
+                                val isTransforming = pressedCount >= 2 || (imageScale > 1f && pan.getDistance() > 0.5f)
+                                if (isTransforming) {
+                                    val oldScale = imageScale
+                                    val nextScale = (oldScale * event.calculateZoom()).coerceIn(1f, 8f)
+                                    val appliedZoom = nextScale / oldScale
+                                    val centroid = event.calculateCentroid(useCurrent = true)
+                                    val center = Offset(imageViewport.width / 2f, imageViewport.height / 2f)
                                     imageScale = nextScale
-                                    imageOffset = if (nextScale == 1f) Offset.Zero else imageOffset + event.calculatePan()
+                                    val proposed = imageOffset * appliedZoom + (centroid - center) * (1f - appliedZoom) + pan
+                                    val constrained = constrainedImageOffset(proposed, nextScale, imageViewport, imageContent)
+                                    if (pressedCount == 1 && edgePreview != 0f) {
+                                        val updated = edgePreview + pan.x
+                                        edgePreview = if (updated.sign != edgePreview.sign) 0f else updated.coerceIn(-imageViewport.width * 0.65f, imageViewport.width * 0.65f)
+                                    } else if (pressedCount == 1 && proposed.x != constrained.x) {
+                                        val canReveal = (pan.x < 0 && pagerState.currentPage < photos.lastIndex) || (pan.x > 0 && pagerState.currentPage > 0)
+                                        if (canReveal) edgePreview = (edgePreview + pan.x * 0.65f).coerceIn(-imageViewport.width * 0.65f, imageViewport.width * 0.65f)
+                                    } else imageOffset = constrained
                                     event.changes.forEach { it.consume() }
                                 }
-                                if (event.changes.none { it.pressed }) break
+                                if (event.changes.none { it.pressed }) {
+                                    val confirmDistance = imageViewport.width * 0.50f
+                                    val targetPage = when {
+                                        edgePreview < -confirmDistance && pagerState.currentPage < photos.lastIndex -> pagerState.currentPage + 1
+                                        edgePreview > confirmDistance && pagerState.currentPage > 0 -> pagerState.currentPage - 1
+                                        else -> null
+                                    }
+                                    scope.launch {
+                                        if (targetPage == null) {
+                                            animate(edgePreview, 0f, animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) { value, _ -> edgePreview = value }
+                                        } else {
+                                            val destination = if (edgePreview < 0f) -imageViewport.width.toFloat() else imageViewport.width.toFloat()
+                                            animate(edgePreview, destination, animationSpec = tween(180)) { value, _ -> edgePreview = value }
+                                            imageScale = 1f
+                                            imageOffset = Offset.Zero
+                                            pagerState.scrollToPage(targetPage)
+                                            edgePreview = 0f
+                                        }
+                                    }
+                                    break
+                                }
                             }
                         }
                     }
@@ -1730,6 +1997,29 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                         scaleX = imageScale; scaleY = imageScale
                         translationX = imageOffset.x; translationY = imageOffset.y
                     },
+                contentScale = ContentScale.Fit
+            )
+            }
+        }
+
+        val previewIndex = when {
+            edgePreview < 0f && pagerState.currentPage < photos.lastIndex -> pagerState.currentPage + 1
+            edgePreview > 0f && pagerState.currentPage > 0 -> pagerState.currentPage - 1
+            else -> null
+        }
+        previewIndex?.let { index ->
+            val previewPhoto = photos[index]
+            val previewRequest = remember(previewPhoto.contentUri) {
+                ImageRequest.Builder(context).data(Uri.parse(previewPhoto.contentUri))
+                    .size(Size.ORIGINAL).precision(Precision.EXACT).crossfade(false).build()
+            }
+            AsyncImage(
+                model = previewRequest,
+                contentDescription = previewPhoto.filename,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    translationX = if (edgePreview < 0f) imageViewport.width + edgePreview
+                    else -imageViewport.width + edgePreview
+                },
                 contentScale = ContentScale.Fit
             )
         }
@@ -1810,29 +2100,110 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val pagerState = rememberPagerState(initialPage = initialIndex.coerceIn(0, photos.lastIndex), pageCount = { photos.size })
     val photo = photos[pagerState.currentPage]
     var scale by remember { mutableFloatStateOf(1f) }; var offset by remember { mutableStateOf(Offset.Zero) }
+    var viewport by remember { mutableStateOf(IntSize.Zero) }
+    var contentSize by remember { mutableStateOf(IntSize.Zero) }
+    var edgePreview by remember { mutableFloatStateOf(0f) }
     var showInfo by remember { mutableStateOf(false) }; var downloading by remember { mutableStateOf(false) }
-    LaunchedEffect(pagerState.currentPage) { scale = 1f; offset = Offset.Zero; showInfo = false }
+    LaunchedEffect(pagerState.currentPage) { scale = 1f; offset = Offset.Zero; edgePreview = 0f; showInfo = false }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         HorizontalPager(state = pagerState, userScrollEnabled = scale == 1f, modifier = Modifier.fillMaxSize()) { page ->
             val item = photos[page]
+            val originalRequest = remember(item.hash, serverUrl) {
+                ImageRequest.Builder(context)
+                    .data(CloudClient().photoUrl(serverUrl, item.hash))
+                    .size(Size.ORIGINAL)
+                    .precision(Precision.EXACT)
+                    .crossfade(false)
+                    .build()
+            }
+            Box(Modifier.fillMaxSize().graphicsLayer { translationX = edgePreview }) {
             AsyncImage(
-                CloudClient().photoUrl(serverUrl, item.hash), item.filename,
-                Modifier.fillMaxSize().pointerInput(item.hash) {
+                originalRequest, item.filename,
+                onSuccess = { state ->
+                    val size = state.painter.intrinsicSize
+                    contentSize = IntSize(size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
+                },
+                modifier = Modifier.fillMaxSize()
+                    .onSizeChanged { viewport = it }
+                    .pointerInput(item.hash) {
+                        detectTapGestures(onDoubleTap = {
+                            scale = if (scale > 1f) 1f else 2.5f
+                            offset = Offset.Zero
+                        })
+                    }
+                    .pointerInput(item.hash) {
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         while (true) {
                             val event = awaitPointerEvent()
-                            if (event.changes.count { it.pressed } >= 2 || scale > 1f) {
-                                val next = (scale * event.calculateZoom()).coerceIn(1f, 8f)
-                                scale = next; offset = if (next == 1f) Offset.Zero else offset + event.calculatePan()
+                            val pressedCount = event.changes.count { it.pressed }
+                            val pan = event.calculatePan()
+                            val isTransforming = pressedCount >= 2 || (scale > 1f && pan.getDistance() > 0.5f)
+                            if (isTransforming) {
+                                val oldScale = scale
+                                val next = (oldScale * event.calculateZoom()).coerceIn(1f, 8f)
+                                val appliedZoom = next / oldScale
+                                val centroid = event.calculateCentroid(useCurrent = true)
+                                val center = Offset(viewport.width / 2f, viewport.height / 2f)
+                                val proposed = offset * appliedZoom + (centroid - center) * (1f - appliedZoom) + pan
+                                val constrained = constrainedImageOffset(proposed, next, viewport, contentSize)
+                                if (pressedCount == 1 && edgePreview != 0f) {
+                                    val updated = edgePreview + pan.x
+                                    edgePreview = if (updated.sign != edgePreview.sign) 0f else updated.coerceIn(-viewport.width * 0.65f, viewport.width * 0.65f)
+                                } else if (pressedCount == 1 && proposed.x != constrained.x) {
+                                    val canReveal = (pan.x < 0 && pagerState.currentPage < photos.lastIndex) || (pan.x > 0 && pagerState.currentPage > 0)
+                                    if (canReveal) edgePreview = (edgePreview + pan.x * 0.65f).coerceIn(-viewport.width * 0.65f, viewport.width * 0.65f)
+                                } else offset = constrained
+                                scale = next
                                 event.changes.forEach { it.consume() }
                             }
-                            if (event.changes.none { it.pressed }) break
+                            if (event.changes.none { it.pressed }) {
+                                val confirmDistance = viewport.width * 0.50f
+                                val targetPage = when {
+                                    edgePreview < -confirmDistance && pagerState.currentPage < photos.lastIndex -> pagerState.currentPage + 1
+                                    edgePreview > confirmDistance && pagerState.currentPage > 0 -> pagerState.currentPage - 1
+                                    else -> null
+                                }
+                                scope.launch {
+                                    if (targetPage == null) {
+                                        animate(edgePreview, 0f, animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) { value, _ -> edgePreview = value }
+                                    } else {
+                                        val destination = if (edgePreview < 0f) -viewport.width.toFloat() else viewport.width.toFloat()
+                                        animate(edgePreview, destination, animationSpec = tween(180)) { value, _ -> edgePreview = value }
+                                        scale = 1f
+                                        offset = Offset.Zero
+                                        pagerState.scrollToPage(targetPage)
+                                        edgePreview = 0f
+                                    }
+                                }
+                                break
+                            }
                         }
                     }
                 }.graphicsLayer {
                     scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y
                 }, contentScale = ContentScale.Fit
+            )
+            }
+        }
+        val previewIndex = when {
+            edgePreview < 0f && pagerState.currentPage < photos.lastIndex -> pagerState.currentPage + 1
+            edgePreview > 0f && pagerState.currentPage > 0 -> pagerState.currentPage - 1
+            else -> null
+        }
+        previewIndex?.let { index ->
+            val previewPhoto = photos[index]
+            val previewRequest = remember(previewPhoto.hash, serverUrl) {
+                ImageRequest.Builder(context).data(CloudClient().photoUrl(serverUrl, previewPhoto.hash))
+                    .size(Size.ORIGINAL).precision(Precision.EXACT).crossfade(false).build()
+            }
+            AsyncImage(
+                model = previewRequest,
+                contentDescription = previewPhoto.filename,
+                modifier = Modifier.fillMaxSize().graphicsLayer {
+                    translationX = if (edgePreview < 0f) viewport.width + edgePreview else -viewport.width + edgePreview
+                },
+                contentScale = ContentScale.Fit
             )
         }
         IconButton(onClick = onBack, modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
@@ -2102,9 +2473,26 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     }
 }
 
+@Composable private fun TimestampToggle(title: String, detail: String, checked: Boolean, change: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) { Text(title, fontWeight = FontWeight.Medium); Text(detail, style = MaterialTheme.typography.bodySmall) }
+        Switch(checked = checked, onCheckedChange = change)
+    }
+}
+
 @Composable private fun SettingsPage(current: String, timestampEnabled: Boolean, saveUrl: (String) -> Unit, saveTimestamp: (Boolean) -> Unit) {
+    val context = LocalContext.current
+    val stampPreferences = remember { context.getSharedPreferences("timestamp_settings", Context.MODE_PRIVATE) }
     var value by remember(current) { mutableStateOf(current) }
-    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    var showWork by remember { mutableStateOf(stampPreferences.getBoolean("show_work", true)) }
+    var showDate by remember { mutableStateOf(stampPreferences.getBoolean("show_date", true)) }
+    var showTime by remember { mutableStateOf(stampPreferences.getBoolean("show_time", true)) }
+    var showCoordinates by remember { mutableStateOf(stampPreferences.getBoolean("show_coordinates", true)) }
+    var showAccuracy by remember { mutableStateOf(stampPreferences.getBoolean("show_accuracy", true)) }
+    var showAddress by remember { mutableStateOf(stampPreferences.getBoolean("show_address", false)) }
+    var fontPercent by remember { mutableFloatStateOf(stampPreferences.getInt("font_percent", 100).toFloat()) }
+    fun saveBoolean(key: String, setting: Boolean) { stampPreferences.edit().putBoolean(key, setting).apply() }
+    Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("ที่อยู่ Computer Server", style = MaterialTheme.typography.titleMedium)
         OutlinedTextField(value, { value = it }, label = { Text("เช่น http://192.168.1.53:8080") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         Button(onClick = { saveUrl(value.trim()) }, enabled = value.startsWith("http://")) { Text("บันทึก") }
@@ -2113,6 +2501,28 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) { Text("แสดง Time stamp", style = MaterialTheme.typography.titleMedium); Text("แสดงวันที่และเวลาทับบนรูปในแอป โดยไม่แก้ไฟล์ต้นฉบับ", style = MaterialTheme.typography.bodySmall) }
             Switch(checked = timestampEnabled, onCheckedChange = saveTimestamp)
+        }
+        HorizontalDivider()
+        Text("ตั้งค่าข้อความบนไฟล์ Timestamp", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text("มีผลกับโหมด Time stamp + GPS และปุ่มสร้าง Time stamp ภายหลัง", style = MaterialTheme.typography.bodySmall)
+        TimestampToggle("ชื่องานและโฟลเดอร์", "แสดงลูกค้า / งาน / โฟลเดอร์", showWork) { showWork = it; saveBoolean("show_work", it) }
+        TimestampToggle("วันที่", "แสดงวันที่ถ่ายจริง", showDate) { showDate = it; saveBoolean("show_date", it) }
+        TimestampToggle("เวลา", "แสดงเวลาถ่ายจริงและเขตเวลา", showTime) { showTime = it; saveBoolean("show_time", it) }
+        TimestampToggle("พิกัด GPS", "แสดง Latitude และ Longitude", showCoordinates) { showCoordinates = it; saveBoolean("show_coordinates", it) }
+        TimestampToggle("ความแม่นยำ GPS", "แสดงค่า Accuracy เป็นเมตร", showAccuracy) { showAccuracy = it; saveBoolean("show_accuracy", it) }
+        TimestampToggle("ถนน / ซอย / ที่อยู่", "ค้นชื่อสถานที่จาก GPS ของรูปหรือ GPS ปัจจุบัน (มีผลกับไฟล์ Timestamp ที่สร้างใหม่)", showAddress) { showAddress = it; saveBoolean("show_address", it) }
+        if (showAddress) Text(
+            "ถ้าขึ้นว่าไม่มีพิกัด ให้เปิด Location ของมือถือและเปิดบันทึกตำแหน่งในกล้อง OPPO ก่อนถ่าย",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text("ขนาดตัวอักษร ${fontPercent.toInt()}%", fontWeight = FontWeight.Medium)
+        Slider(
+            value = fontPercent, onValueChange = { fontPercent = it }, valueRange = 60f..180f, steps = 11,
+            onValueChangeFinished = { stampPreferences.edit().putInt("font_percent", fontPercent.toInt()).apply() }
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("เล็ก 60%", style = MaterialTheme.typography.labelSmall); Text("ปกติ 100%", style = MaterialTheme.typography.labelSmall); Text("ใหญ่ 180%", style = MaterialTheme.typography.labelSmall)
         }
     }
 }

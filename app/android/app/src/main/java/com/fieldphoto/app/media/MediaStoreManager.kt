@@ -14,6 +14,7 @@ import android.graphics.Color
 import android.graphics.ImageDecoder
 import android.graphics.Paint
 import android.media.ExifInterface
+import android.location.Geocoder
 import java.io.IOException
 import java.security.MessageDigest
 import java.time.OffsetDateTime
@@ -77,7 +78,11 @@ class MediaStoreManager(private val context: Context) {
             }
             val coordinates = FloatArray(2)
             val hasGps = exif.getLatLong(coordinates)
-            PhotoExif(captured, coordinates[0].toDouble().takeIf { hasGps }, coordinates[1].toDouble().takeIf { hasGps })
+            val latitude = coordinates[0].toDouble()
+            val longitude = coordinates[1].toDouble()
+            val validGps = hasGps && latitude in -90.0..90.0 && longitude in -180.0..180.0 &&
+                !(latitude == 0.0 && longitude == 0.0)
+            PhotoExif(captured, latitude.takeIf { validGps }, longitude.takeIf { validGps })
         }
     }.getOrNull() ?: PhotoExif(null, null, null)
 
@@ -252,13 +257,34 @@ class MediaStoreManager(private val context: Context) {
         latitude: Double?, longitude: Double?, accuracy: Float?
     ) {
         val canvas = Canvas(bitmap)
-        val size = (bitmap.width / 38f).coerceIn(28f, 72f)
+        val preferences = context.getSharedPreferences("timestamp_settings", Context.MODE_PRIVATE)
+        val fontScale = preferences.getInt("font_percent", 100).coerceIn(60, 180) / 100f
+        val size = ((bitmap.width / 38f).coerceIn(28f, 72f) * fontScale).coerceIn(18f, 130f)
         val padding = size * 0.55f
-        val lines = buildList {
-            add(if (client == "งานทั่วไป") listOf(job, location).filter { it.isNotBlank() }.joinToString(" / ") else "$client / $job / $location")
-            add(capturedAt.format(DateTimeFormatter.ofPattern("dd/MM/yyyy  HH:mm:ss XXX", Locale.US)))
-            if (latitude != null && longitude != null) add("Lat %.6f   Lon %.6f".format(Locale.US, latitude, longitude))
-            add(if (accuracy != null) "Accuracy +/- %.1f m".format(Locale.US, accuracy) else "GPS unavailable")
+        val rawLines = buildList {
+            if (preferences.getBoolean("show_work", true)) add(
+                if (client == "งานทั่วไป") listOf(job, location).filter { it.isNotBlank() }.joinToString(" / ")
+                else listOf(client, job, location).filter { it.isNotBlank() }.joinToString(" / ")
+            )
+            val showDate = preferences.getBoolean("show_date", true)
+            val showTime = preferences.getBoolean("show_time", true)
+            if (showDate || showTime) add(listOfNotNull(
+                capturedAt.format(DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.US)).takeIf { showDate },
+                capturedAt.format(DateTimeFormatter.ofPattern("HH:mm:ss XXX", Locale.US)).takeIf { showTime }
+            ).joinToString("  "))
+            if (preferences.getBoolean("show_coordinates", true) && latitude != null && longitude != null)
+                add("Lat %.6f   Lon %.6f".format(Locale.US, latitude, longitude))
+            if (preferences.getBoolean("show_accuracy", true))
+                add(if (accuracy != null) "Accuracy +/- %.1f m".format(Locale.US, accuracy) else "GPS unavailable")
+            if (preferences.getBoolean("show_address", false)) {
+                add(
+                    when {
+                        latitude == null || longitude == null -> "ที่อยู่: ไม่มีพิกัด GPS ในรูป"
+                        else -> reverseAddress(latitude, longitude)?.let { "ที่อยู่: $it" }
+                            ?: "ที่อยู่: ค้นหาชื่อสถานที่ไม่สำเร็จ"
+                    }
+                )
+            }
         }
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
@@ -266,12 +292,38 @@ class MediaStoreManager(private val context: Context) {
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             setShadowLayer((size * 0.12f).coerceAtLeast(3f), 1.5f, 1.5f, Color.BLACK)
         }
+        val maxTextWidth = bitmap.width - padding * 2
+        val lines = rawLines.flatMap { line -> wrapStampLine(line, textPaint, maxTextWidth) }
         val lineHeight = size * 1.3f
         val boxHeight = padding * 2 + lineHeight * lines.size
         lines.forEachIndexed { index, line ->
             canvas.drawText(line, padding, bitmap.height - boxHeight + padding + size + index * lineHeight, textPaint)
         }
     }
+
+    private fun wrapStampLine(text: String, paint: Paint, maxWidth: Float): List<String> {
+        if (paint.measureText(text) <= maxWidth) return listOf(text)
+        val result = mutableListOf<String>(); var current = ""
+        text.split(Regex("\\s+")).forEach { word ->
+            val candidate = if (current.isBlank()) word else "$current $word"
+            if (paint.measureText(candidate) <= maxWidth) current = candidate
+            else { if (current.isNotBlank()) result += current; current = word }
+        }
+        if (current.isNotBlank()) result += current
+        return result.ifEmpty { listOf(text) }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun reverseAddress(latitude: Double, longitude: Double): String? = runCatching {
+        if (!Geocoder.isPresent()) return@runCatching null
+        val address = Geocoder(context, Locale("th", "TH")).getFromLocation(latitude, longitude, 1)?.firstOrNull()
+            ?: return@runCatching null
+        address.getAddressLine(0)?.trim()?.takeIf { it.isNotBlank() } ?: listOf(
+            address.featureName, address.subThoroughfare, address.thoroughfare,
+            address.subLocality, address.locality, address.subAdminArea, address.adminArea,
+            address.postalCode, address.countryName
+        ).mapNotNull { it?.trim()?.takeIf(String::isNotBlank) }.distinct().joinToString(" ").ifBlank { null }
+    }.getOrNull()
 
     fun copyOriginal(source: Uri, client: String, job: String, location: String, capturedAt: OffsetDateTime): StoredPhoto {
         val (target, relative, filename) = newDestination(client, job, location, capturedAt)
