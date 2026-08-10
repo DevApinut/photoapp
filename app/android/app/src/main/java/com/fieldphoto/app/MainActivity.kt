@@ -567,35 +567,41 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                             containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow
                         )
                     ) {
-                        Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                Modifier.size(44.dp).background(
-                                    if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
-                                    RoundedCornerShape(14.dp)
-                                ), contentAlignment = Alignment.Center
-                            ) {
-                                Icon(if (selected) Icons.Default.Check else Icons.Default.Folder, null,
-                                    tint = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer)
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(row.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                Text(if (matchingCloud != null) "อยู่ในเครื่อง + Server • แตะเพื่อเปิด" else "แตะเพื่อเปิด • กดค้างเพื่อเลือก", style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            if (selectedJobIds.isEmpty() && matchingCloud != null) IconButton(onClick = {
-                                openCloud(matchingCloud.jobId, matchingCloud.clientName, matchingCloud.jobName)
-                            }) { Icon(Icons.Default.CloudDone, "มีทั้งในเครื่องและ Server", tint = MaterialTheme.colorScheme.primary) }
-                            if (selectedJobIds.isEmpty()) IconButton(onClick = { jobInfo = row }) {
-                                Icon(Icons.Default.Info, "ข้อมูลงาน")
-                            }
-                            if (selectedJobIds.isEmpty()) IconButton(onClick = { jobToRename = row }) { Icon(Icons.Default.Edit, "เปลี่ยนชื่องาน") }
-                            if (selectedJobIds.isEmpty()) IconButton(onClick = {
-                                scope.launch {
-                                    deleteBackupSummary = repo.jobBackupSummary(row.id)
-                                    jobToDelete = row
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    Modifier.size(40.dp).background(
+                                        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
+                                        RoundedCornerShape(14.dp)
+                                    ), contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(if (selected) Icons.Default.Check else Icons.Default.Folder, null,
+                                        tint = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer)
                                 }
-                            }) { Icon(Icons.Default.Delete, "ลบงาน") }
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(row.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                    Text(if (matchingCloud != null) "อยู่ในเครื่อง + Server" else "อยู่ในเครื่อง", style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                            if (selectedJobIds.isEmpty()) Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (matchingCloud != null) IconButton(modifier = Modifier.size(36.dp), onClick = {
+                                    openCloud(matchingCloud.jobId, matchingCloud.clientName, matchingCloud.jobName)
+                                }) { Icon(Icons.Default.CloudDone, "เปิดข้อมูลบน Server", Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary) }
+                                IconButton(modifier = Modifier.size(36.dp), onClick = { jobInfo = row }) { Icon(Icons.Default.Info, "ข้อมูลงาน", Modifier.size(20.dp)) }
+                                IconButton(modifier = Modifier.size(36.dp), onClick = { jobToRename = row }) { Icon(Icons.Default.Edit, "เปลี่ยนชื่องาน", Modifier.size(20.dp)) }
+                                IconButton(modifier = Modifier.size(36.dp), onClick = {
+                                    scope.launch {
+                                        deleteBackupSummary = repo.jobBackupSummary(row.id)
+                                        jobToDelete = row
+                                    }
+                                }) { Icon(Icons.Default.Delete, "ลบงาน", Modifier.size(20.dp)) }
+                            }
                         }
                     }
                 }

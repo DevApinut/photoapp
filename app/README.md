@@ -1,7 +1,7 @@
 # DN — Photo Work Manager + Photo Sync
 
 เอกสารส่งต่องานหลักของโปรเจกต์ DN ครอบคลุม Android App และ Computer Server  
-อัปเดตล่าสุด: 9 สิงหาคม 2026
+อัปเดตล่าสุด: 10 สิงหาคม 2026
 
 > **คำสั่งสำหรับการทำงานครั้งต่อไป:** อ่านไฟล์นี้ทั้งหมดก่อนแก้โค้ด ตรวจไฟล์จริงประกอบเสมอ และอัปเดต README เมื่อมีการเปลี่ยนฟีเจอร์ ฐานข้อมูล API วิธี Build หรือพฤติกรรมสำคัญ
 
@@ -18,6 +18,8 @@
 - Server ที่ต้องใช้คือ `DN-Photo-Server-V5.exe`; START/STOP scripts รองรับ V5 แล้ว
 - Compatibility สำคัญ: Backup เก่ามี `job_id=null`; Android ต้อง normalize ค่า JSON `null` เป็นค่าว่าง แล้วจัดกลุ่มด้วย `client_name + job_name` ห้ามใช้ข้อความ `"null"` เป็น ID เพราะจะทำให้งานเก่าทุกงานถูกรวมกัน
 - Server Catalog สังเคราะห์โฟลเดอร์แม่จาก path ของรูป/PDF/โน้ต เพื่อซ่อม hierarchy ของ Backup เก่าที่ `_DN_INFO.json` ไม่ครบ
+- งาน Local และ Server ที่มี `job_id` เดียวกันแสดงเป็นการ์ดเดียว; งานชื่อเหมือนแต่ ID ต่างกันยังต้องแยก
+- ภายในโฟลเดอร์ รูป Local/Server จับคู่ด้วย SHA-256: Hash เดียวกันแสดง `CloudDone`, เฉพาะ Server แสดงโปร่งพร้อมก้อนเมฆ
 
 ## 1. เป้าหมายของระบบ
 
@@ -363,10 +365,10 @@ Health check: `http://127.0.0.1:8080/health`
 สถานะการตรวจล่าสุด:
 
 - ผู้ใช้ยืนยันว่า Android Studio Build/Run ได้ตามปกติ
-- การตรวจจาก command line ของ Codex ถูกจำกัดด้วยสิทธิ์อ่าน Android SDK/license ของระบบ
+- การตรวจจาก command line ใช้ Java 21 และ `:app:compileDebugKotlin` ได้สำเร็จ
 - Android Studio รุ่นปัจจุบันมี JBR 25.0.2 แต่ Gradle 8.11.1 ใช้ Java 21 ได้แน่นอน; เครื่องมี `C:\Users\HP\.jdks\jbr-21.0.11`
 - หาก Gradle ใน Android Studio มีปัญหา ให้ตั้ง Gradle JDK เป็น Java 21 หรือ JDK 17 แทน Java 25
-- Android `:app:compileDebugKotlin` ผ่านด้วย Java 21 หลังเพิ่มฟีเจอร์ย้ายและ Cloud Gallery
+- Android `:app:compileDebugKotlin` ผ่านด้วย Java 21 หลังเพิ่ม Gesture viewer, PDF import/share, Local+Cloud merge และ UI compact
 - Server test suite เดิมผ่านครบ และเพิ่ม test ยืนยันว่างานชื่อเหมือนกันแต่ต่าง `job_id` ถูกแยกเป็นคนละโฟลเดอร์
 - สร้าง `DN-Photo-Server-V5.exe` สำเร็จแล้ว; ต้องใช้ V5 คู่กับ Android รุ่น `job_id`
 
@@ -419,11 +421,11 @@ Manifest ใช้:
 - ถ่ายหลายรูปด้วยกล้อง OPPO แล้วกลับ DN
 - ปัดปิด DN ระหว่างกล้อง แล้วตรวจ recovery picker
 - นำเข้ารูปจาก Gallery และตรวจ EXIF/GPS
-- เปิด Viewer, swipe, pinch zoom และปุ่ม `ⓘ`
+- เปิด Viewer, double-tap, pinch ตาม centroid, edge preview 50%, swipe และปุ่ม `ⓘ`
 - สร้าง Timestamp ตอนถ่ายและภายหลัง
 - ลบรูปจาก Gallery แล้วกลับ DN
 - เลือกหลายรูปเพื่อแชร์และลบ
-- สแกน PDF และตรวจใน `Download/MyPhotoApp`
+- สแกนและนำเข้า PDF ตรวจใน `Download/MyPhotoApp`, แชร์เดี่ยว/หลายไฟล์ และยืนยันก่อนลบ
 - เพิ่ม/แก้/ลบโน้ต และค้นหางานด้วยข้อความในโน้ต
 - ตรวจปุ่ม `ⓘ` งานและโน้ต
 - ทดสอบ Sort และ Filter ทั้งสองประเภท/ช่วงวันที่
@@ -451,6 +453,7 @@ Manifest ใช้:
 - บันทึก `addedAt` แยกจาก `capturedAt` เพื่อกรองเวลานำเข้า DN จริง
 - ปรับ versionCode/versionName และกระบวนการ Release APK
 - รวมชื่อ EXE เก่าหลายเวอร์ชันให้เหลือไฟล์เดียวเมื่อยืนยัน V5 เสถียร
+- รวม cloud-only folder เข้า hierarchy ของงาน Local โดยไม่สร้างข้อมูล Room ปลอม
 
 ## 12. จุดเริ่มต้นสำหรับผู้ช่วยครั้งต่อไป
 
@@ -463,3 +466,133 @@ Manifest ใช้:
 5. ทำการเปลี่ยนแปลงให้ครบ Android + Server + migration/tests ตามขอบเขต
 6. ทดสอบตามความเสี่ยง
 7. อัปเดตส่วนที่เกี่ยวข้องใน README และวันที่ด้านบน
+
+## 13. รายละเอียดการเปลี่ยนแปลงล่าสุด — 10 สิงหาคม 2026
+
+หัวข้อนี้เป็นบันทึกส่งต่อสำหรับ AI/ผู้พัฒนารอบถัดไป ต้องอ่านร่วมกับหัวข้อ 3–12 และตรวจโค้ดจริงก่อนแก้
+
+### 13.1 Timestamp, GPS และชื่อที่อยู่
+
+ไฟล์หลัก: `media/MediaStoreManager.kt`, `data/PhotoRepository.kt`, `MainActivity.kt`
+
+- Settings มีสวิตช์แยกสำหรับชื่องาน/โฟลเดอร์, วันที่, เวลา, Lat/Lon, Accuracy และถนน/ซอย/ที่อยู่
+- ขนาดตัวอักษร Timestamp ตั้งได้ 60–180%; ข้อความยาวถูกตัดบรรทัดตามความกว้างภาพ
+- ชื่อที่อยู่ได้จาก Android `Geocoder` ภาษาไทย โดยอาศัย latitude/longitude ไม่ใช่การอ่านข้อความจาก Gallery OPPO
+- ถ้าเปิดที่อยู่แต่รูปไม่มี GPS ต้องเขียน `ที่อยู่: ไม่มีพิกัด GPS ในรูป`; ถ้ามีพิกัดแต่ reverse-geocode ไม่สำเร็จต้องเขียน `ที่อยู่: ค้นหาชื่อสถานที่ไม่สำเร็จ` ห้ามหายเงียบ
+- พิกัด `(0,0)` ถือว่าไม่ถูกต้องทั้งจาก EXIF และฐานข้อมูล ห้ามนำไปพิมพ์บนรูป
+- การถ่าย/นำเข้าจาก OPPO ขอ GPS ปัจจุบันด้วย `getCurrentLocation(PRIORITY_HIGH_ACCURACY)` แทนการเชื่อ `lastLocation` อย่างเดียว
+- ปุ่มสร้าง Timestamp ภายหลังอ่าน EXIF ของไฟล์ต้นฉบับก่อน แล้วจึง fallback ไปข้อมูล Room ที่ผ่านการตรวจ `(0,0)`
+- การตั้งค่า Timestamp มีผลเฉพาะไฟล์ Timestamp ที่สร้างใหม่ รูป Timestamp เดิมไม่เปลี่ยนย้อนหลัง ต้องลบ/สร้างใหม่เอง
+- Gallery OPPO อาจแสดงสถานที่จากฐานข้อมูลเฉพาะของ OPPO โดยไม่ได้เขียนลง EXIF; กรณีนี้ DN/แอปอื่นไม่สามารถอ่านพิกัดนั้นได้
+
+### 13.2 Viewer ความละเอียดเต็มและ Gesture
+
+ไฟล์หลัก: `MainActivity.kt` — `PhotoViewer`, `CloudPhotoViewer`, `constrainedImageOffset`
+
+- Viewer Local และ Cloud ใช้ Coil `ImageRequest.size(Size.ORIGINAL)` + `Precision.EXACT`; ห้ามเปลี่ยนกลับเป็นการ decode ตามขนาดจอ เพราะซูมแล้วตัวหนังสือจะแตก
+- ไฟล์ต้นฉบับไม่ได้ถูก resize/recompress จากการดูรูป การโหลด Original ใช้ RAM และอาจเปิดครั้งแรกช้ากว่าเดิม
+- แตะสองครั้งสลับระหว่าง 1× และ 2.5×; pinch รองรับ 1–8×
+- Pinch ต้องยึด centroid ระหว่างสองนิ้ว ไม่ใช่กึ่งกลางหน้าจอ สูตร offset ชดเชยตาม zoom factor
+- ขอบเขต pan คำนวณจากขนาดภาพหลัง `ContentScale.Fit` และ viewport จริง เพื่อไม่ให้ลากขึ้น/ลงไปเห็นพื้นที่ดำเกินภาพ
+- ขณะ scale > 1 ปิด native pager swipe แล้วใช้ edge-preview ของ DN:
+  - ลากภาพถึงขอบซ้าย/ขวาแล้วลากต่อ รูปข้างเคียงค่อย ๆ โผล่ตามนิ้ว
+  - ลากย้อนกลับได้ก่อนปล่อย
+  - ต้องผ่าน 50% ของความกว้างจอจึงยืนยันเปลี่ยนรูป
+  - ไม่ถึงระยะให้ spring กลับอย่างนุ่มนวล
+  - ผ่านระยะให้ preview เลื่อนปิดเต็มจอ แล้วรีเซ็ต scale/offset ก่อน `scrollToPage` เพื่อป้องกันรูปใหญ่แวบ
+- Pager ตัด content นอกขอบ page จึงมี AsyncImage preview แยกนอก Pager; อย่าลบชั้นนี้ มิฉะนั้นเห็นพื้นดำแทนรูปข้างเคียง
+- พฤติกรรมทั้งหมดต้องเหมือนกันใน Local และ Cloud viewer
+
+### 13.3 การย้ายรูปและโฟลเดอร์
+
+ไฟล์หลัก: `MainActivity.kt` — move picker, `PhotoRepository.movePhotos/moveFolder`
+
+- การย้ายใช้ browser ปลายทางแบบ File Manager ไม่ใช้รายการ path ยาวแบบเดิม
+- ขั้นตอน: เลือกงาน → เข้าโฟลเดอร์ซ้อนได้หลายชั้น → Back ถอยโฟลเดอร์แม่/รายการงาน → กด `ย้ายมาที่นี่`
+- การแตะโฟลเดอร์เป็นเพียงการเข้าไปดู ห้ามย้ายทันที
+- ปุ่ม Back ของ Android ขณะ dialog เปิดต้องย้อน hierarchy ก่อน ไม่ปิด dialog ตั้งแต่ครั้งแรก
+- ห้ามย้ายโฟลเดอร์เข้า subtree ของตัวเอง; repository มี validation นี้อยู่
+- `moveFolder` ย้ายรูป, PDF และโน้ตใน subtree พร้อมสร้างปลายทางที่ขาด
+
+### 13.4 Template งาน
+
+- Template รองรับ path ซ้อนด้วย `/` และขยาย parent path อัตโนมัติ เช่น `ก่อนทำ/ตู้ไฟ 1`
+- กดใช้ Template ต้องเปิด dialog ตั้งชื่องานก่อน ห้ามสร้างทันที
+- ช่องชื่อ prefill ด้วยชื่อ Template; ผู้ใช้แก้ได้ ถ้าปล่อยว่างใช้ default
+- ใช้ `createQuickJobFromTemplate` เพื่อสร้างชื่อไม่ซ้ำเป็น `(2)`, `(3)` และคืน `actualName` สำหรับเปิดหน้าที่ถูกต้อง
+- การสร้างงานเปล่าและ dialog ชื่อทั่วไปยังใช้ปุ่ม `บันทึก`; label `สร้างงาน` ใช้เฉพาะ flow สร้างงาน
+
+### 13.5 PDF: สแกน, นำเข้า, แชร์ และลบ
+
+ไฟล์หลัก: `PhotoRepository.saveScannedPdf/importPdf/removeDocument`, `PhotosPage`
+
+- `สแกน PDF` ใช้ ML Kit Document Scanner และบันทึกใต้ `Download/MyPhotoApp/...`
+- `นำเข้า PDF` ใช้ `ActivityResultContracts.OpenDocument()` MIME `application/pdf`
+- การนำเข้าคัดลอกไฟล์เข้า storage ของ DN, คงชื่อเดิม, เปิดด้วย `PdfRenderer` เพื่อนับหน้า, คำนวณ SHA-256 และสร้าง `DocumentEntity` สถานะ `WAITING`
+- PDF ที่นำเข้า/สแกนถูก Sync ขึ้น Server ด้วย flow เอกสารเดิมและปรากฏใน Cloud Catalog
+- แชร์ PDF เดี่ยวใช้ `ACTION_SEND`, `application/pdf`, `ClipData` และ `FLAG_GRANT_READ_URI_PERMISSION`
+- แชร์หลาย PDF: กดค้างไฟล์แรก → แตะเพิ่ม → ปุ่มแชร์ด้านบน ใช้ `ACTION_SEND_MULTIPLE` พร้อม URI/ClipData ทุกไฟล์
+- ระหว่างเลือกหลาย PDF ปุ่มแชร์/ลบรายไฟล์ถูกซ่อน ลดการกดผิด
+- ลบ PDF ต้องมี confirm dialog แสดงชื่อ, page count และเตือนถ้า status ไม่ใช่ `UPLOADED`; ห้ามลบทันทีจากไอคอน
+- การลบ PDF จะลบทั้งแถว Room และไฟล์ในพื้นที่เอกสารที่ DN สร้าง
+
+### 13.6 คำค้นหาและ UI รายการงาน
+
+- `QuickJobsPage` เก็บคำค้นหาใน SharedPreferences `job_list/search`
+- เข้าไปดูงานแล้ว Back คำค้นหาต้องคงอยู่ รวมถึงการ re-create composable; กด X จึงล้างค่า preference
+- Sort เก็บใน `job_list/sort` ตามเดิม
+- การ์ดงานจัดสองแถวแบบ compact เพื่อไม่ให้ไอคอนเบียดชื่อเป็นแนวตั้ง:
+  - แถวบน: folder, ชื่องาน, สถานะ Local/Server
+  - แถวล่าง: Cloud, info, rename, delete
+  - vertical padding 6dp, folder 40dp, action touch area 36dp, icon 20dp
+- หากจะเพิ่ม action ใหม่ ห้ามนำกลับไปวางต่อท้ายข้อความแถวบน; ใช้แถว action หรือ overflow menu
+
+### 13.7 การรวม Local + Server
+
+ไฟล์หลัก: `QuickJobsPage`, `PhotosPage`, `CloudClient.catalog`
+
+- งานจับคู่ด้วย `job_id` เท่านั้น งานชื่อเดียวกันแต่ ID ต่างกันต้องแสดงแยก
+- `cloudOnlyJobs` คือ Cloud jobs ที่ไม่มี ID ใน local rows; แสดงแบบโปร่ง/Cloud เหมือนเดิม
+- งานที่ ID มีทั้งสองฝั่งแสดงการ์ด Local เพียงใบเดียว พร้อม `CloudDone` และข้อความ `อยู่ในเครื่อง + Server`
+- ไอคอน Cloud บนการ์ดเปิด Cloud view ของงานนั้น ส่วนแตะตัวการ์ดเปิด Local hierarchy
+- `PhotosPage` โหลด Cloud Catalog ของ `place.jobId` แล้วกรองด้วย `locationName == place.name`
+- รูปจับคู่ด้วย SHA-256 (`PhotoEntity.sha256` กับ `CloudPhoto.hash`) ไม่ใช้ filename
+- Hash มีทั้งสองฝั่ง: แสดงรูป Local ครั้งเดียวพร้อม `CloudDone`
+- เฉพาะ Server: แสดงรูปโปร่งพร้อมก้อนเมฆ เปิดด้วย `CloudPhotoViewer`; ไม่สร้างสำเนาในเครื่องจนกว่าผู้ใช้สั่งดาวน์โหลด
+- ปัจจุบันการรวมรูปทำในโฟลเดอร์ Local ที่มีอยู่ หากมี folder ที่อยู่เฉพาะ Server ทั้งก้อน ผู้ใช้ยังเปิดผ่านปุ่ม Cloud ของการ์ดงาน; งานอนาคตคือรวม cloud-only folder เข้า local hierarchy โดยไม่สร้าง Room row ปลอม
+- Catalog refresh ปัจจุบันเกิดเมื่อ `serverUrl`, `rows`, `jobId` หรือ composable เปลี่ยน หากลบข้อมูล Server นอกแอปอาจต้อง Back/เปิดแอปใหม่หรือ Sync
+
+### 13.8 ข้อมูลทดสอบที่ลบออกจาก Server
+
+- เคยมี artifact เก่า `server/data/PhotoBackup/ทดสอบ/ทดสอบ (2)/AA/_DN_INFO.json`
+- ระบุ job_id `9a1428d9-81a3-4a23-88ae-ac233d5bd809` และไม่มีรูปจริง
+- วันที่ 10 สิงหาคม 2026 ลบโฟลเดอร์นี้, stale `uploaded_photos` 1 row และ `backup_jobs` 1 row แล้ว
+- ไม่พบ seed/hardcode ที่สร้าง `ทดสอบ/AA` ใน Android หรือ Server source; เป็นข้อมูลจริงเก่าที่ค้างใน `server/data`
+- ห้ามเพิ่ม sample/test data ลง `server/data`; Server tests ต้องใช้ `tmp_path` เท่านั้น
+
+### 13.9 การตรวจล่าสุด
+
+- ทุกชุดแก้ Android ล่าสุดตรวจด้วย `:app:compileDebugKotlin` และ Java 21 ผ่าน
+- คำสั่งที่ใช้บนเครื่องนี้:
+
+```powershell
+$env:JAVA_HOME='C:\Users\HP\.jdks\jbr-21.0.11'
+cd android
+.\gradlew.bat --no-daemon :app:compileDebugKotlin --console=plain
+```
+
+- Warning ปัจจุบันส่วนใหญ่เป็น Material icon deprecated (`AutoMirrored`), `LocalLifecycleOwner` ย้าย package และ Room `fallbackToDestructiveMigration` deprecated; ไม่ใช่ compile error แต่ควรเก็บเป็นงาน cleanup
+- หลังแก้ UI/gesture ต้องทดสอบบน OPPO จริง เพราะ multi-touch, ColorOS picker, MediaStore permission และ memory ของรูป Original ต่างจาก emulator
+
+### 13.10 Checklist เพิ่มเติมสำหรับรอบถัดไป
+
+- ค้นหางาน → เปิดงานผิด → Back: query/sort/filter ที่ควรคงอยู่ต้องไม่หาย
+- ต่อ Server ที่มี job_id ซ้ำกับ Local: ต้องมีการ์ดเดียวและ `CloudDone`
+- ทดสอบรูปสามสถานะ: Local only, Local+Server hash เดียวกัน, Server only
+- Pinch ที่มุมภาพต้องซูมตามนิ้ว; double-tap ต้องกลับ 1×
+- ลากขอบขณะซูมต่ำกว่า 50% ต้อง spring กลับ; เกิน 50% ต้องเปลี่ยนหน้าโดยไม่มีภาพใหญ่แวบ
+- เปิดภาพตัวหนังสือเล็กและเทียบ Gallery ว่า DN ใช้ Original decode
+- สร้างงานจาก Template โดยใช้ default, เปลี่ยนชื่อ และชื่อซ้ำ `(2)`
+- ย้ายรูป/โฟลเดอร์ผ่าน hierarchy และกด Back หลายชั้นก่อนยืนยัน
+- นำเข้า PDF หลายหน้า, Sync, แชร์เดี่ยว, แชร์หลายไฟล์ และยืนยันก่อนลบ
+- เปิด Timestamp address กับรูปมี GPS/ไม่มี GPS/พิกัด 0,0 และตรวจข้อความ fallback
