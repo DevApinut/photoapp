@@ -270,8 +270,9 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                     openCloud = { jobId, client, job -> navigate(Page.CloudJob(jobId, client, job)) })
                 is Page.Jobs -> JobsPage(repo, p.client) { navigate(Page.Places(it)) }
                 is Page.Places -> PlacesPage(repo, p.job) { navigate(Page.Photos(it)) }
-                is Page.Photos -> PhotosPage(repo, p.place, p.title,
+                is Page.Photos -> PhotosPage(repo, serverUrl, p.place, p.title,
                     openPhoto = { photos, index -> navigate(Page.Viewer(photos, index)) },
+                    openCloudPhoto = { photos, index -> navigate(Page.CloudViewer(photos, index)) },
                     openFolder = { folder ->
                         navigate(Page.Photos(folder, "${p.title} › ${folder.name.substringAfterLast('/')}") )
                     })
@@ -347,7 +348,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
         mutableStateOf(runCatching { JobSortMode.valueOf(jobPreferences.getString("sort", JobSortMode.LATEST_PHOTO.name)!!) }
             .getOrDefault(JobSortMode.LATEST_PHOTO))
     }
-    var jobSearch by remember { mutableStateOf("") }
+    var jobSearch by remember { mutableStateOf(jobPreferences.getString("search", "").orEmpty()) }
     val jobFlow = remember(jobSortMode, jobSearch) {
         val query = jobSearch.trim()
         if (query.isNotEmpty()) repo.dao.searchQuickJobs(query)
@@ -404,6 +405,9 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
         cloudCatalog.notes.map { CloudJobSummary(it.jobId, it.clientName, it.jobName) })
         .filter { jobSearch.isBlank() || it.jobName.contains(jobSearch.trim(), true) }
         .distinctBy { if (it.jobId.isNotBlank()) it.jobId else "${it.clientName}/${it.jobName}" }
+    val localJobIds = rows.mapTo(mutableSetOf()) { it.id }
+    val cloudOnlyJobs = cloudJobs.filter { it.jobId.isBlank() || it.jobId !in localJobIds }
+    val cloudByLocalJobId = cloudJobs.filter { it.jobId.isNotBlank() }.associateBy { it.jobId }
     var selectedJobIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     val selectedJobs = rows.filter { it.id in selectedJobIds }
     val allVisibleJobsSelected = visibleRows.isNotEmpty() && visibleRows.all { it.id in selectedJobIds }
@@ -465,10 +469,10 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 }
             }
             OutlinedTextField(
-                value = jobSearch, onValueChange = { jobSearch = it },
+                value = jobSearch, onValueChange = { jobSearch = it; jobPreferences.edit().putString("search", it).apply() },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                 leadingIcon = { Icon(Icons.Default.Search, null) },
-                trailingIcon = { if (jobSearch.isNotEmpty()) IconButton(onClick = { jobSearch = "" }) { Icon(Icons.Default.Close, "ล้างการค้นหา") } },
+                trailingIcon = { if (jobSearch.isNotEmpty()) IconButton(onClick = { jobSearch = ""; jobPreferences.edit().remove("search").apply() }) { Icon(Icons.Default.Close, "ล้างการค้นหา") } },
                 placeholder = { Text("ค้นหาชื่องานหรือข้อความในโน้ต") }, singleLine = true
             )
             Surface(
@@ -522,14 +526,14 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 5.dp),
                 style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary
             )
-            if (visibleRows.isEmpty() && cloudJobs.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            if (visibleRows.isEmpty() && cloudOnlyJobs.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Text(if (rows.isEmpty() && !cloudLoading) "กด + งานใหม่ เพื่อเริ่มถ่ายรูป" else if (cloudLoading) "กำลังตรวจสอบ Server…" else "ไม่พบงานที่ค้นหา")
             } else LazyColumn(
                 Modifier.weight(1f),
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 92.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                items(cloudJobs, key = { "cloud-${it.jobId}-${it.clientName}-${it.jobName}" }) { cloudJob ->
+                items(cloudOnlyJobs, key = { "cloud-${it.jobId}-${it.clientName}-${it.jobName}" }) { cloudJob ->
                     Surface(
                         modifier = Modifier.fillMaxWidth().clickable { openCloud(cloudJob.jobId, cloudJob.clientName, cloudJob.jobName) },
                         shape = RoundedCornerShape(18.dp),
@@ -549,6 +553,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 }
                 items(visibleRows) { row ->
                     val selected = row.id in selectedJobIds
+                    val matchingCloud = cloudByLocalJobId[row.id]
                     ElevatedCard(
                         modifier = Modifier.fillMaxWidth().combinedClickable(
                             onClick = {
@@ -575,9 +580,12 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(row.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                Text("แตะเพื่อเปิด • กดค้างเพื่อเลือก", style = MaterialTheme.typography.bodySmall,
+                                Text(if (matchingCloud != null) "อยู่ในเครื่อง + Server • แตะเพื่อเปิด" else "แตะเพื่อเปิด • กดค้างเพื่อเลือก", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
+                            if (selectedJobIds.isEmpty() && matchingCloud != null) IconButton(onClick = {
+                                openCloud(matchingCloud.jobId, matchingCloud.clientName, matchingCloud.jobName)
+                            }) { Icon(Icons.Default.CloudDone, "มีทั้งในเครื่องและ Server", tint = MaterialTheme.colorScheme.primary) }
                             if (selectedJobIds.isEmpty()) IconButton(onClick = { jobInfo = row }) {
                                 Icon(Icons.Default.Info, "ข้อมูลงาน")
                             }
@@ -974,13 +982,22 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable private fun PhotosPage(
-    repo: PhotoRepository, place: LocationEntity, pageTitle: String,
-    openPhoto: (List<PhotoEntity>, Int) -> Unit, openFolder: (LocationEntity) -> Unit
+    repo: PhotoRepository, serverUrl: String, place: LocationEntity, pageTitle: String,
+    openPhoto: (List<PhotoEntity>, Int) -> Unit, openCloudPhoto: (List<CloudPhoto>, Int) -> Unit,
+    openFolder: (LocationEntity) -> Unit
 ) {
     val rows by repo.dao.photos(place.id).collectAsStateWithLifecycle(emptyList())
     val documents by repo.dao.documents(place.id).collectAsStateWithLifecycle(emptyList())
     val notes by repo.dao.notes(place.id).collectAsStateWithLifecycle(emptyList())
     val allFolders by repo.dao.locations(place.jobId).collectAsStateWithLifecycle(emptyList())
+    var cloudCatalog by remember(place.jobId) { mutableStateOf(CloudCatalog()) }
+    LaunchedEffect(serverUrl, place.jobId) {
+        cloudCatalog = runCatching { CloudClient().catalog(serverUrl) }.getOrDefault(CloudCatalog())
+    }
+    val cloudPhotosHere = cloudCatalog.photos.filter { it.jobId == place.jobId && it.locationName == place.name }
+    val localHashes = rows.mapTo(mutableSetOf()) { it.sha256 }
+    val cloudHashes = cloudPhotosHere.mapTo(mutableSetOf()) { it.hash }
+    val cloudOnlyPhotos = cloudPhotosHere.filter { it.hash !in localHashes }
     val prefix = if (place.name.isBlank()) "" else "${place.name}/"
     val childFolders = allFolders.filter { candidate ->
         candidate.id != place.id && candidate.name.startsWith(prefix) && !candidate.name.removePrefix(prefix).contains('/')
@@ -1397,7 +1414,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 }, enabled = gridColumns < 5) { Icon(Icons.Default.Add, "เพิ่มจำนวนรูปต่อแถว") }
             }
         }
-        if (rows.isEmpty() && childFolders.isEmpty() && documents.isEmpty() && notes.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { Text("ยังไม่มีข้อมูลใน $pageTitle") }
+        if (rows.isEmpty() && cloudOnlyPhotos.isEmpty() && childFolders.isEmpty() && documents.isEmpty() && notes.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { Text("ยังไม่มีข้อมูลใน $pageTitle") }
         else LazyVerticalGrid(
             columns = GridCells.Fixed(gridColumns),
             modifier = Modifier.weight(1f),
@@ -1491,6 +1508,21 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     }
                 }
             }
+            gridItemsIndexed(cloudOnlyPhotos, key = { _, photo -> "cloud-${photo.hash}" }) { index, photo ->
+                ElevatedCard(
+                    Modifier.fillMaxWidth().aspectRatio(1f).clickable { openCloudPhoto(cloudOnlyPhotos, index) },
+                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Box(Modifier.fillMaxSize().graphicsLayer(alpha = 0.68f)) {
+                        AsyncImage(CloudClient().photoUrl(serverUrl, photo.hash), photo.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        Icon(
+                            Icons.Default.Cloud, "อยู่บน Server เท่านั้น", tint = Color.White,
+                            modifier = Modifier.align(Alignment.TopStart).padding(7.dp)
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.9f), RoundedCornerShape(50)).padding(5.dp)
+                        )
+                    }
+                }
+            }
             gridItemsIndexed(rows, key = { _, photo -> photo.id }) { index, photo ->
                 val selected = photo.id in selectedPhotoIds
                 ElevatedCard(
@@ -1500,6 +1532,11 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     )
                 ) { Box(Modifier.fillMaxSize()) {
                     AsyncImage(Uri.parse(photo.contentUri), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    if (photo.sha256 in cloudHashes && !selected) Icon(
+                        Icons.Default.CloudDone, "มีทั้งในเครื่องและ Server", tint = Color.White,
+                        modifier = Modifier.align(Alignment.TopStart).padding(7.dp)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.88f), RoundedCornerShape(50)).padding(5.dp)
+                    )
                     if (selected) {
                         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)))
                         Icon(
