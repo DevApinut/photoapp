@@ -1072,6 +1072,10 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var selectedRecoveryUris by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showRecoveryDialog by remember { mutableStateOf(false) }
     var recoveryWithStamp by remember { mutableStateOf(false) }
+    var oppoImportLoading by remember { mutableStateOf(false) }
+    var oppoGpsMissingDialog by remember { mutableStateOf(false) }
+    var oppoPendingGpsPhotos by remember { mutableStateOf<List<Pair<Uri, Long>>>(emptyList()) }
+    var oppoPendingGpsStamp by remember { mutableStateOf(false) }
     var noteDialog by remember { mutableStateOf(false) }
     var editingNote by remember { mutableStateOf<NoteEntity?>(null) }
     var noteInfo by remember { mutableStateOf<NoteEntity?>(null) }
@@ -1346,42 +1350,71 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
     }
 
-    fun importOppoPhotos(selected: List<Pair<Uri, Long>>, withStamp: Boolean, useCurrentLocation: Boolean = true) {
-        if (selected.isEmpty()) return
-        fun importAll(latitude: Double?, longitude: Double?, accuracy: Float?) {
-            scope.launch {
-                var imported = 0
-                selected.forEach { (uri, takenAt) ->
-                    val capturedAt = OffsetDateTime.ofInstant(Instant.ofEpochMilli(takenAt), ZoneId.systemDefault())
-                    runCatching {
-                        if (withStamp) {
-                            val info = repo.media.galleryInfo(uri)
-                            val exif = repo.media.readExif(uri)
-                            val actualTime = exif.capturedAt ?: capturedAt
-                            val actualLat = exif.latitude ?: latitude
-                            val actualLon = exif.longitude ?: longitude
-                            repo.attachGalleryPhoto(place.id, uri, actualTime, actualLat, actualLon, accuracy)
-                            repo.createTimestampFromSource(place.id, uri, info.filename, actualTime, actualLat, actualLon, accuracy)
-                        } else repo.attachGalleryPhoto(place.id, uri, capturedAt, latitude, longitude, accuracy)
+    fun importOppoPhotos(
+        selected: List<Pair<Uri, Long>>,
+        withStamp: Boolean,
+        useCurrentLocation: Boolean = true,
+        saveWithoutGps: Boolean = false,
+    ) {
+        if (selected.isEmpty()) { oppoImportLoading = false; return }
+        oppoImportLoading = true
+        fun saveAll(fallbackLat: Double?, fallbackLon: Double?, fallbackAccuracy: Float?) = scope.launch {
+            var imported = 0
+            selected.forEach { (uri, takenAt) ->
+                val fallbackTime = OffsetDateTime.ofInstant(Instant.ofEpochMilli(takenAt), ZoneId.systemDefault())
+                runCatching {
+                    val exif = repo.media.readExif(uri)
+                    val actualTime = exif.capturedAt ?: fallbackTime
+                    // Register the original immediately. Never wait for a fresh GPS
+                    // request before the photo becomes visible in the job.
+                    val latitude = exif.latitude ?: fallbackLat
+                    val longitude = exif.longitude ?: fallbackLon
+                    repo.attachGalleryPhoto(place.id, uri, actualTime, latitude, longitude, fallbackAccuracy)
+                    if (withStamp) {
+                        val info = repo.media.galleryInfo(uri)
+                        repo.createTimestampFromSource(
+                            place.id, uri, info.filename, actualTime,
+                            latitude, longitude, fallbackAccuracy
+                        )
                     }
-                        .onSuccess { imported++ }
-                }
-                // Keep the marker until the next recovery scan. OPPO may publish the
-                // remaining burst photos/videos to MediaStore after this first import.
-                Toast.makeText(context, "นำเข้ารูปจาก OPPO $imported รูปแล้ว", Toast.LENGTH_LONG).show()
+                }.onSuccess { imported++ }
             }
+            oppoImportLoading = false
+            Toast.makeText(context, "นำเข้ารูปจาก OPPO $imported รูปแล้ว", Toast.LENGTH_LONG).show()
         }
-        if (useCurrentLocation && ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+        scope.launch {
+            val missingGps = selected.any { (uri, _) ->
+                val exif = repo.media.readExif(uri)
+                exif.latitude == null || exif.longitude == null
+            }
+            if (!missingGps || saveWithoutGps || !useCurrentLocation) {
+                saveAll(null, null, null)
+                return@launch
+            }
+            oppoPendingGpsPhotos = selected
+            oppoPendingGpsStamp = withStamp
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                oppoImportLoading = false
+                oppoGpsMissingDialog = true
+                return@launch
+            }
+            var resolved = false
+            fun finish(location: android.location.Location?) {
+                if (resolved) return
+                resolved = true
+                val valid = location?.takeIf {
+                    it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 &&
+                        !(it.latitude == 0.0 && it.longitude == 0.0)
+                }
+                if (valid != null) saveAll(valid.latitude, valid.longitude, valid.accuracy)
+                else { oppoImportLoading = false; oppoGpsMissingDialog = true }
+            }
             LocationServices.getFusedLocationProviderClient(context)
                 .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
-                .addOnCompleteListener { task ->
-                    val current = task.result?.takeIf {
-                        it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 &&
-                            !(it.latitude == 0.0 && it.longitude == 0.0)
-                    }
-                    current?.let { importAll(it.latitude, it.longitude, it.accuracy) } ?: importAll(null, null, null)
-                }
-        } else importAll(null, null, null)
+                .addOnCompleteListener { task -> finish(if (task.isSuccessful) task.result else null) }
+            delay(8000)
+            finish(null)
+        }
     }
 
     fun importOppoVideos(selected: List<Uri>) {
@@ -1435,6 +1468,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         val savedLocation = recoveryPreferences.getString("oppo_recovery_location", null)
         val savedStartedAt = recoveryPreferences.getLong("oppo_recovery_started", 0L)
         if (savedLocation == place.id && savedStartedAt > 0L) {
+            oppoImportLoading = true
             val withStamp = pendingOppoStamp ?: recoveryPreferences.getBoolean("oppo_recovery_stamp", false)
             val startedAt = pendingOppoStartedAt.takeIf { it > 0L } ?: savedStartedAt
             recoveryPreferences.edit().putBoolean("oppo_recovery_returning", true).apply()
@@ -1443,9 +1477,13 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 val canReadImages = ContextCompat.checkSelfPermission(context, mediaPermission) == PackageManager.PERMISSION_GRANTED
                 var recent = emptyList<RecentImage>()
                 if (canReadImages) {
-                    delay(2500)
-                    recent = runCatching { repo.media.imagesAddedSince(startedAt) }.getOrDefault(emptyList())
-                        .distinctBy { it.uri.toString() }.sortedBy { it.capturedAtMillis }
+                    var checks = 0
+                    while (recent.isEmpty() && checks < 5) {
+                        recent = runCatching { repo.media.imagesAddedSince(startedAt) }.getOrDefault(emptyList())
+                            .distinctBy { it.uri.toString() }.sortedBy { it.capturedAtMillis }
+                        if (recent.isEmpty()) delay(500)
+                        checks++
+                    }
                 }
                 if (recent.isNotEmpty()) {
                     pendingOppoStamp = null
@@ -1455,9 +1493,11 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 } else {
                     recoveryPreferences.edit().remove("oppo_recovery_returning").apply()
                     if (canReadImages) {
+                        oppoImportLoading = false
                         Toast.makeText(context, "หาไฟล์ใหม่อัตโนมัติไม่พบ กรุณาเลือกภาพที่เพิ่งถ่าย", Toast.LENGTH_LONG).show()
                         oppoBatchPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                     } else {
+                        oppoImportLoading = false
                         pendingOppoStamp = null
                         Toast.makeText(context, "ต้องอนุญาตเข้าถึงรูปเพื่อรับรูปจากกล้องอัตโนมัติ", Toast.LENGTH_LONG).show()
                     }
@@ -1478,7 +1518,6 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 .apply()
             val intent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
             if (intent.resolveActivity(context.packageManager) == null) kotlin.error("ไม่พบแอปกล้องในเครื่อง")
-            Toast.makeText(context, "ถ่ายต่อเนื่องได้เลย เสร็จแล้วใช้ปุ่มหรือท่าทางย้อนกลับของ Android", Toast.LENGTH_LONG).show()
             externalCamera.launch(intent)
         }.onFailure {
             pendingOppoStamp = null
@@ -2010,6 +2049,34 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             dismissButton = { TextButton(onClick = { folderToDelete = null }) { Text("ยกเลิก") } }
         )
     }
+    if (oppoImportLoading) AlertDialog(
+        onDismissRequest = {},
+        title = { Text("กำลังรับรูปจากกล้อง OPPO") },
+        text = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                CircularProgressIndicator(Modifier.size(30.dp), strokeWidth = 3.dp)
+                Text("กำลังค้นหารูปและตรวจสอบพิกัด กรุณารอสักครู่")
+            }
+        },
+        confirmButton = {}
+    )
+    if (oppoGpsMissingDialog) AlertDialog(
+        onDismissRequest = {},
+        title = { Text("ยังไม่พบพิกัด GPS") },
+        text = { Text("รูปยังไม่ถูกทิ้ง เลือกลองค้นหาพิกัดอีกครั้ง หรือบันทึกรูปโดยไม่มี GPS") },
+        confirmButton = {
+            Button(onClick = {
+                oppoGpsMissingDialog = false
+                importOppoPhotos(oppoPendingGpsPhotos, oppoPendingGpsStamp)
+            }) { Text("ลองหา GPS ใหม่") }
+        },
+        dismissButton = {
+            OutlinedButton(onClick = {
+                oppoGpsMissingDialog = false
+                importOppoPhotos(oppoPendingGpsPhotos, oppoPendingGpsStamp, saveWithoutGps = true)
+            }) { Text("บันทึกโดยไม่มี GPS") }
+        }
+    )
     if (showRecoveryDialog) AlertDialog(
         onDismissRequest = { showRecoveryDialog = false },
         title = { Text("พบรูปหรือวิดีโอที่ยังไม่ได้นำเข้างาน") },
