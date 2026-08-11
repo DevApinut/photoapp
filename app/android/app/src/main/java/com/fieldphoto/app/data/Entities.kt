@@ -64,6 +64,7 @@ data class DocumentEntity(
     @PrimaryKey val id: String, val locationId: String, val contentUri: String, val filename: String,
     val sha256: String, val pageCount: Int, val createdAt: String,
     val status: UploadStatus = UploadStatus.WAITING, val lastError: String? = null,
+    val mimeType: String = "application/pdf",
 )
 
 @Entity(
@@ -78,7 +79,7 @@ data class NoteEntity(
 
 data class PendingDocument(
     val id: String, val jobId: String, val contentUri: String, val filename: String, val sha256: String, val pageCount: Int,
-    val createdAt: String, val locationName: String, val jobName: String, val clientName: String,
+    val createdAt: String, val mimeType: String, val locationName: String, val jobName: String, val clientName: String,
 )
 
 data class PendingNote(
@@ -87,3 +88,8 @@ data class PendingNote(
 )
 
 data class JobActivity(val jobId: String, val lastPhotoAt: String?)
+
+data class LocalFileSearchResult(
+    val id: String, val kind: String, val contentUri: String, val filename: String, val mimeType: String,
+    val jobName: String, val locationName: String, val capturedAt: String,
+)

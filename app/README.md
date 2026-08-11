@@ -1,7 +1,7 @@
 # DN — Photo Work Manager + Photo Sync
 
 เอกสารส่งต่องานหลักของโปรเจกต์ DN ครอบคลุม Android App และ Computer Server  
-อัปเดตล่าสุด: 10 สิงหาคม 2026
+อัปเดตล่าสุด: 11 สิงหาคม 2026
 
 > **คำสั่งสำหรับการทำงานครั้งต่อไป:** อ่านไฟล์นี้ทั้งหมดก่อนแก้โค้ด ตรวจไฟล์จริงประกอบเสมอ และอัปเดต README เมื่อมีการเปลี่ยนฟีเจอร์ ฐานข้อมูล API วิธี Build หรือพฤติกรรมสำคัญ
 
@@ -61,8 +61,8 @@ app/
 │     ├─ data/
 │     │  ├─ Entities.kt             Room entities และ DTO
 │     │  ├─ AppDao.kt               Room queries
-│     │  ├─ AppDatabase.kt          Room DB version 2 + migration 1→2
-│     │  └─ PhotoRepository.kt      กฎงาน/ไฟล์/ลบ/PDF/โน้ต
+│     │  ├─ AppDatabase.kt          Room DB version 3 + migration 1→2 และ 2→3
+│     │  └─ PhotoRepository.kt      กฎงาน/ไฟล์/ลบ/PDF/วิดีโอ/โน้ต
 │     ├─ media/MediaStoreManager.kt MediaStore, EXIF, SHA-256, Timestamp
 │     └─ sync/SyncClient.kt          Manual Sync ด้วย OkHttp
 ├─ server/
@@ -230,7 +230,7 @@ Download/MyPhotoApp/<งาน>/<โฟลเดอร์>/SCAN_yyyyMMdd_HHmmss.
 
 ## 4. การจัดเก็บข้อมูลในมือถือ
 
-Room database: `photo-work.sqlite3`, version 2
+Room database: `photo-work.sqlite3`, version 3
 
 Entities:
 
@@ -586,6 +586,8 @@ cd android
 
 ### 13.10 Checklist เพิ่มเติมสำหรับรอบถัดไป
 
+ก่อนทำ Checklist ให้ทราบการเปลี่ยนแปลงล่าสุดในหัวข้อ 13.11 ด้านล่างด้วย
+
 - ค้นหางาน → เปิดงานผิด → Back: query/sort/filter ที่ควรคงอยู่ต้องไม่หาย
 - ต่อ Server ที่มี job_id ซ้ำกับ Local: ต้องมีการ์ดเดียวและ `CloudDone`
 - ทดสอบรูปสามสถานะ: Local only, Local+Server hash เดียวกัน, Server only
@@ -596,3 +598,68 @@ cd android
 - ย้ายรูป/โฟลเดอร์ผ่าน hierarchy และกด Back หลายชั้นก่อนยืนยัน
 - นำเข้า PDF หลายหน้า, Sync, แชร์เดี่ยว, แชร์หลายไฟล์ และยืนยันก่อนลบ
 - เปิด Timestamp address กับรูปมี GPS/ไม่มี GPS/พิกัด 0,0 และตรวจข้อความ fallback
+
+### 13.11 วิดีโอและชื่อเริ่มต้นจาก Template — 11 สิงหาคม 2026
+
+ไฟล์หลัก: `MainActivity.kt`, `Entities.kt`, `AppDao.kt`, `AppDatabase.kt`, `PhotoRepository.kt`, `SyncClient.kt`, `CloudClient.kt`, `server/app.py`
+
+- ปุ่ม `กล้อง OPPO` เปิดหน้ากล้องแบบเต็มซึ่งผู้ใช้สลับโหมดรูป/วิดีโอในกล้อง OPPO ได้เอง เมื่อย้อนกลับ DN จะค้นทั้งรูปและวิดีโอที่สร้างหลังเวลาเปิดกล้องแล้วนำเข้าในงาน
+- มีปุ่ม `นำเข้าวิดีโอ` เปิดตัวเลือกไฟล์เดิมด้วย MIME `video/*`
+- วิดีโอถูกคัดลอกแบบไฟล์ต้นฉบับโดยไม่แปลงหรือลดคุณภาพ ไปยัง `Movies/MyPhotoApp/<ลูกค้า>/<งาน>/<โฟลเดอร์>` ผ่าน MediaStore
+- วิดีโอใช้รายการไฟล์ชุดเดียวกับ PDF แต่แยกชนิดด้วย `DocumentEntity.mimeType`; แสดงไอคอน Play, เปิดเล่นด้วยแอปวิดีโอในเครื่อง, แชร์เดี่ยว/หลายไฟล์ และลบโดยมีข้อความยืนยันที่ตรงกับชนิดไฟล์
+- Sync ส่ง MIME ไปที่ `/upload-document`; Server บันทึก `mime_type` ใน `_DN_INFO.json` และตอบไฟล์กลับด้วย media type ที่ถูกต้อง
+- Cloud Catalog อ่าน `mime_type`; วิดีโอบน Server แตะเพื่อเล่น และการดาวน์โหลดทั้งงาน/โฟลเดอร์กู้วิดีโอกลับเข้า `Movies` ได้
+- Room database เพิ่มจาก version 2 เป็น version 3 โดย migration `2→3` เพิ่มคอลัมน์ `documents.mimeType TEXT NOT NULL DEFAULT 'application/pdf'`; PDF เก่าจึงยังเปิดได้ตามเดิมโดยข้อมูลไม่หาย
+- Dialog สร้างงานจาก Template ไม่กรอกชื่อไว้ล่วงหน้าแล้ว แต่แสดงชื่อ Template เป็น placeholder: ถ้าปล่อยช่องว่างจะใช้ชื่อ Template, ถ้าพิมพ์จะใช้ชื่อที่พิมพ์ และระบบยังเติม `(2)`, `(3)` เมื่อชื่อซ้ำ
+- สร้าง `DN-Photo-Server-V6.exe` แล้ว และ `START-DN-SERVER.cmd` ชี้ไป V6; V5 ที่เปิดอยู่ต้องปิดด้วย `STOP-DN-SERVER.cmd` ก่อนเปิดใหม่ จึงจะเริ่มใช้ระบบวิดีโอ
+
+### 13.12 ประสิทธิภาพหน้ารวมรูป — 11 สิงหาคม 2026
+
+- Grid รูป Local และ Server ใช้ Coil `ImageRequest` ขนาดตัวอย่างสูงสุด 512×512 px พร้อม cache key คงที่ แทนการถอดรหัสรูปต้นฉบับหลายล้านพิกเซลทุกช่อง
+- หน้ากู้รูปจากกล้องใช้ภาพตัวอย่าง 384×384 px
+- ปิด crossfade ใน Grid เพื่อลดงานวาดซ้ำขณะเลื่อน และใช้ `Precision.INEXACT` เพื่อให้ decoder เลือก sample size ที่ประหยัดหน่วยความจำ
+- การเปลี่ยนแปลงนี้มีผลเฉพาะ Thumbnail ในหน้ารวม; `PhotoViewer` และ `CloudPhotoViewer` ยังคงใช้ `Size.ORIGINAL` กับ `Precision.EXACT` เพื่อดูและซูมไฟล์เต็มความละเอียด
+- Lazy grid โหลดเฉพาะรายการที่อยู่ใกล้หน้าจอ จึงรองรับจำนวนรูปมากขึ้นโดยไม่สร้าง bitmap ของทุกรูปพร้อมกัน
+
+### 13.13 เปลี่ยนชื่องานหลัง Backup และล้างงานทดสอบเก่า — 11 สิงหาคม 2026
+
+- เดิม Server ตาราง `backup_jobs` จำ `storage_name` ครั้งแรกตาม `job_id` ตลอดไป จึงทำให้งานที่เปลี่ยนจาก `A (2)` เป็น `A` ยัง Backup ลง `A (2)`
+- `storage_job_name()` ตรวจ `requested_name` และ client ทุกครั้ง หากชื่อเปลี่ยนจะย้ายโฟลเดอร์เดิมไปชื่อใหม่เมื่อปลายทางว่าง อัปเดต `backup_jobs` และแก้ `uploaded_photos.stored_path/client_name/job_name` ให้ตรงกัน
+- ถ้าชื่อปลายทางมีโฟลเดอร์ของงานอื่นอยู่จริง ระบบยังเติม `(2)`, `(3)` เพื่อไม่รวมข้อมูลคนละ `job_id` หรือเขียนทับไฟล์เก่า
+- กรณีเปลี่ยนชื่องานใหม่กลับไปใช้ชื่อของงานเก่าที่ลบจากมือถือแล้ว แต่ Server ยังมี backup อยู่: Server จะเก็บงานเก่าโดยย้ายเป็น `<ชื่อ> (เดิม)` และให้งานที่เพิ่งเปลี่ยนชื่อใช้ `<ชื่อ>` ตามที่ผู้ใช้ตั้ง จึงไม่สูญเสียหรือรวมข้อมูลสอง job_id
+- งานทดสอบเก่ารหัส `9a1428d9-81a3-4a23-88ae-ac233d5bd809` ยังค้างใน Room บนมือถือ จึงส่ง `/folder` มาสร้าง `ทดสอบ/ทดสอบ/AA` ใหม่ทุก Sync แม้ลบฝั่ง Server
+- Android เรียก `cleanupLegacyEmptyTestJob()` ครั้งเดียวเมื่อเปิดแอป และลบเฉพาะเมื่อ ID/ชื่อ/โฟลเดอร์ตรงกับ artifact เก่าและไม่มีรูป เอกสาร วิดีโอ หรือโน้ต จึงไม่แตะงานจริง
+- วันที่ 11 สิงหาคม 2026 ลบโฟลเดอร์ metadata-only และแถว `backup_jobs` ของ artifact นี้ออกจาก `server/data` แล้ว
+
+### 13.14 โหมดค้นหาไฟล์แยกจากค้นหางาน — 11 สิงหาคม 2026
+
+- หน้า `งานทั้งหมด` ยังใช้ช่องค้นหางาน/ข้อความในโน้ตและตัวกรองเดิมเหมือนเดิม
+- เพิ่มปุ่ม `ค้นหาไฟล์ รูปภาพ PDF หรือวิดีโอ` เปิดหน้า `FileSearchPage` แยกต่างหาก
+- `AppDao.searchLocalFiles()` ใช้ UNION ค้นชื่อไฟล์จากตาราง `photos` และ `documents` ทั่วทุกงาน จำกัดผลล่าสุด 200 รายการ
+- ผลลัพธ์แสดงชื่อไฟล์ ชื่องาน โฟลเดอร์ วันเวลา และ Thumbnail สำหรับรูป โดย Thumbnail ใช้ decode 192×192 พร้อม memory cache
+- มีตัวกรองในโหมดค้นหาไฟล์: ทั้งหมด, รูป, PDF และวิดีโอ
+- แตะรูปเพื่อเปิดใน `PhotoViewer` ของ DN ด้วยไฟล์ต้นฉบับ; แตะ PDF/วิดีโอเพื่อเปิดด้วยตัวอ่านหรือเครื่องเล่นที่ Android รองรับ
+- คำค้นหาไฟล์เก็บแยกใน SharedPreferences `file_search/query` ไม่กระทบคำค้นหาและ sort/filter ของหน้างาน
+
+### 13.15 ป้องกันหน้าจอล็อกระหว่าง Sync — 11 สิงหาคม 2026
+
+- `PhotoWorkApp` ใช้ `LocalView.current.keepScreenOn` ตามค่า `syncing`
+- ตั้งเป็น `true` เฉพาะตั้งแต่ผู้ใช้กด Sync จนกระทั่งสำเร็จหรือผิดพลาด แล้วคืนเป็น `false` อัตโนมัติผ่าน `DisposableEffect`
+- หากออกจาก composable ระหว่างทำงาน `onDispose` จะคืนค่าเพื่อไม่ให้หน้าจอเปิดค้าง
+- พฤติกรรมนี้ไม่ใช่ Background/Auto Sync: แอปยัง Sync เฉพาะเมื่อผู้ใช้กด และเพียงป้องกัน timeout ของหน้าจอระหว่างงานที่กำลังทำ
+
+### 13.16 ลดอาการกระตุกเพิ่มเติมใน Grid รูป — 11 สิงหาคม 2026
+
+- เพิ่ม `LocalGridThumbnail()` ซึ่งเรียก `ContentResolver.loadThumbnail()` บน `Dispatchers.IO` เพื่อใช้ Thumbnail ที่ MediaStore จัดการ แทนการเปิดไฟล์ต้นฉบับผ่าน Coil ทุกครั้ง
+- หาก ContentProvider ไม่รองรับ `loadThumbnail()` จะ fallback ไป Coil request ขนาดย่อ จึงยังรองรับ URI จาก Photo Picker
+- ขนาด Thumbnail ปรับตามจำนวนรูปต่อแถว: 1=720, 2=480, 3=360, 4=280 และ 5=224 px ลด RAM/decode โดยเฉพาะโหมด 3–5 รูปต่อแถว
+- การ์ดรูป Local และ Cloud เปลี่ยนจาก `ElevatedCard` เป็น `Card` เพื่อตัดงานวาดเงาจำนวนมากระหว่างเลื่อน
+- Cloud grid ภายในหน้าดู Server ใช้ Thumbnail 360 px และ cache key แยกตามขนาด
+- การโหลด Thumbnail ทำงานนอก UI thread; หน้าดูเต็มจอและซูมยังใช้ Original เหมือนเดิม
+
+### 13.17 ปรับ Overlay ให้สมส่วนตามจำนวนรูปต่อแถว — 11 สิงหาคม 2026
+
+- ไอคอน Cloud, CloudDone, Check และปุ่มถังขยะใน Grid ใช้ขนาดร่วมจาก `gridColumns` ไม่ยึดขนาดเดิมเมื่อช่องรูปเล็กลง
+- ขนาดพื้นหลังไอคอนสำหรับ 1–5 รูปต่อแถวคือ 40, 32, 28, 24 และ 20 dp
+- ขนาดตัวไอคอนคือ 23, 18, 16, 14 และ 12 dp พร้อมลดขอบนอกจาก 7 dp เหลือ 2 dp ตามลำดับ
+- พื้นที่แตะถังขยะจึงไม่บังรูปมากเกินไปในโหมด 4–5 รูป และโหมด 1–2 รูปยังมองเห็น/กดได้สะดวก

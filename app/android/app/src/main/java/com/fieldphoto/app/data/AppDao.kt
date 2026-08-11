@@ -32,6 +32,19 @@ interface AppDao {
     """)
     fun searchQuickJobs(query: String): Flow<List<JobEntity>>
     @Query("""
+        SELECT * FROM (
+            SELECT p.id AS id, 'PHOTO' AS kind, p.contentUri AS contentUri, p.filename AS filename,
+                   'image/jpeg' AS mimeType, j.name AS jobName, l.name AS locationName, p.capturedAt AS capturedAt
+            FROM photos p JOIN locations l ON l.id=p.locationId JOIN jobs j ON j.id=l.jobId
+            UNION ALL
+            SELECT d.id AS id, 'DOCUMENT' AS kind, d.contentUri AS contentUri, d.filename AS filename,
+                   d.mimeType AS mimeType, j.name AS jobName, l.name AS locationName, d.createdAt AS capturedAt
+            FROM documents d JOIN locations l ON l.id=d.locationId JOIN jobs j ON j.id=l.jobId
+        ) WHERE filename LIKE '%' || :query || '%' COLLATE NOCASE
+        ORDER BY capturedAt DESC LIMIT 200
+    """)
+    fun searchLocalFiles(query: String): Flow<List<LocalFileSearchResult>>
+    @Query("""
         SELECT j.id AS jobId, MAX(p.capturedAt) AS lastPhotoAt
         FROM jobs j LEFT JOIN locations l ON l.jobId=j.id LEFT JOIN photos p ON p.locationId=l.id
         GROUP BY j.id
@@ -91,6 +104,7 @@ interface AppDao {
     @Query("DELETE FROM photos WHERE id = :id") suspend fun deletePhotoRow(id: String)
     @Query("DELETE FROM locations WHERE id = :id") suspend fun deleteLocation(id: String)
     @Query("DELETE FROM jobs WHERE id = :id") suspend fun deleteJob(id: String)
+    @Query("SELECT * FROM jobs WHERE id = :id LIMIT 1") suspend fun jobOrNull(id: String): JobEntity?
     @Query("SELECT * FROM locations WHERE jobId = :jobId AND (name = :path OR name LIKE :prefix) ORDER BY length(name) DESC")
     suspend fun folderTree(jobId: String, path: String, prefix: String): List<LocationEntity>
 
@@ -110,7 +124,7 @@ interface AppDao {
     suspend fun syncFolders(): List<PendingFolder>
 
     @Query("""
-        SELECT d.id,j.id AS jobId,d.contentUri,d.filename,d.sha256,d.pageCount,d.createdAt,
+        SELECT d.id,j.id AS jobId,d.contentUri,d.filename,d.sha256,d.pageCount,d.createdAt,d.mimeType,
                l.name AS locationName,j.name AS jobName,c.name AS clientName
         FROM documents d JOIN locations l ON l.id=d.locationId JOIN jobs j ON j.id=l.jobId JOIN clients c ON c.id=j.clientId
         WHERE d.status IN (:statuses) ORDER BY d.createdAt

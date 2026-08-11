@@ -26,6 +26,16 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
     val media = MediaStoreManager(context)
     private fun now() = OffsetDateTime.now().toString()
 
+    suspend fun cleanupLegacyEmptyTestJob() = withContext(Dispatchers.IO) {
+        val legacyId = "9a1428d9-81a3-4a23-88ae-ac233d5bd809"
+        val job = dao.jobOrNull(legacyId) ?: return@withContext
+        val locations = dao.locationsNow(legacyId)
+        val hasContent = locations.any { location ->
+            dao.photosNow(location.id).isNotEmpty() || dao.documentsNow(location.id).isNotEmpty() || dao.notesNow(location.id).isNotEmpty()
+        }
+        if (!hasContent && job.name == "ทดสอบ" && locations.all { it.name.isBlank() || it.name == "AA" }) dao.deleteJob(legacyId)
+    }
+
     suspend fun movePhotos(photoIds: List<String>, targetLocationId: String) = withContext(Dispatchers.IO) {
         if (photoIds.isNotEmpty()) dao.movePhotos(photoIds, targetLocationId)
     }
@@ -97,19 +107,21 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
         val location = dao.locationByName(job.id, cloud.locationName)
             ?: LocationEntity(UUID.randomUUID().toString(), job.id, cloud.locationName, now()).also { dao.insertLocation(it) }
         val photoPath = media.relativePath(client.name, job.name, location.name)
-        val relative = "${Environment.DIRECTORY_DOWNLOADS}/${photoPath.substringAfter('/').trimStart('/')}"
-        val target = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, cloud.filename); put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+        val isVideo = cloud.mimeType.startsWith("video/")
+        val relative = "${if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_DOWNLOADS}/${photoPath.substringAfter('/').trimStart('/')}"
+        val collection = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val target = context.contentResolver.insert(collection, ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, cloud.filename); put(MediaStore.MediaColumns.MIME_TYPE, cloud.mimeType)
             put(MediaStore.MediaColumns.RELATIVE_PATH, relative); put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }) ?: error("สร้าง PDF ไม่สำเร็จ")
+        }) ?: error(if (isVideo) "สร้างไฟล์วิดีโอไม่สำเร็จ" else "สร้าง PDF ไม่สำเร็จ")
         try {
             CloudClient().openDocument(serverUrl, cloud.id).use { response ->
-                if (!response.isSuccessful) error("ดาวน์โหลด PDF ไม่สำเร็จ: ${response.code}")
+                if (!response.isSuccessful) error("ดาวน์โหลดไฟล์ไม่สำเร็จ: ${response.code}")
                 context.contentResolver.openOutputStream(target).use { output -> response.body?.byteStream().use { input -> requireNotNull(output); requireNotNull(input); input.copyTo(output) } }
             }
             context.contentResolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            dao.insertDocument(DocumentEntity(UUID.randomUUID().toString(), location.id, target.toString(), cloud.filename,
-                media.sha256(target), cloud.pageCount, cloud.createdAt, UploadStatus.UPLOADED))
+            dao.insertDocument(DocumentEntity(id = UUID.randomUUID().toString(), locationId = location.id, contentUri = target.toString(), filename = cloud.filename,
+                sha256 = media.sha256(target), pageCount = cloud.pageCount, createdAt = cloud.createdAt, status = UploadStatus.UPLOADED, mimeType = cloud.mimeType))
         } catch (error: Throwable) { context.contentResolver.delete(target, null, null); throw error }
     }
 
@@ -475,6 +487,33 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
             resolver.delete(target, null, null)
             throw error
         }
+    }
+
+    suspend fun importVideo(locationId: String, source: Uri) = withContext(Dispatchers.IO) {
+        val resolver = context.contentResolver
+        val mimeType = resolver.getType(source)?.takeIf { it.startsWith("video/") } ?: "video/mp4"
+        val originalName = resolver.query(source, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }?.trim()?.takeIf { it.isNotBlank() } ?: "VIDEO_${OffsetDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.mp4"
+        val location = dao.location(locationId); val job = dao.job(location.jobId); val client = dao.client(job.clientId)
+        val hierarchy = media.relativePath(client.name, job.name, location.name).substringAfter('/').trimStart('/')
+        val target = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, originalName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/$hierarchy")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }) ?: error("สร้างไฟล์วิดีโอไม่สำเร็จ")
+        try {
+            resolver.openInputStream(source).use { input ->
+                requireNotNull(input) { "อ่านวิดีโอไม่สำเร็จ" }
+                resolver.openOutputStream(target).use { output -> requireNotNull(output); input.copyTo(output) }
+            }
+            resolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            dao.insertDocument(DocumentEntity(
+                id = UUID.randomUUID().toString(), locationId = locationId, contentUri = target.toString(), filename = originalName,
+                sha256 = media.sha256(target), pageCount = 0, createdAt = now(), mimeType = mimeType
+            ))
+        } catch (error: Throwable) { resolver.delete(target, null, null); throw error }
     }
 
     suspend fun addNote(locationId: String, title: String, content: String) = withContext(Dispatchers.IO) {

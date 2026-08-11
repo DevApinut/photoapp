@@ -25,6 +25,7 @@ import java.util.Locale
 
 data class StoredPhoto(val uri: Uri, val relativePath: String, val filename: String, val sha256: String)
 data class RecentImage(val uri: Uri, val capturedAtMillis: Long)
+data class RecentVideo(val uri: Uri, val capturedAtMillis: Long)
 data class GalleryImageInfo(val filename: String, val relativePath: String)
 data class PhotoExif(val capturedAt: OffsetDateTime?, val latitude: Double?, val longitude: Double?)
 
@@ -163,6 +164,32 @@ class MediaStoreManager(private val context: Context) {
                 val addedMillis = cursor.getLong(addedColumn) * 1000L
                 val takenMillis = cursor.getLong(takenColumn).takeIf { it > 0L } ?: addedMillis
                 results += RecentImage(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id), takenMillis)
+            }
+        }
+        return results
+    }
+
+    fun videosAddedSince(startedAtMillis: Long): List<RecentVideo> {
+        val results = mutableListOf<RecentVideo>()
+        val projection = arrayOf(
+            MediaStore.Video.Media._ID, MediaStore.Video.Media.DATE_ADDED,
+            MediaStore.Video.Media.DATE_TAKEN, MediaStore.Video.Media.RELATIVE_PATH,
+        )
+        val startedSeconds = (startedAtMillis / 1000L) - 2L
+        resolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, projection,
+            "${MediaStore.Video.Media.DATE_ADDED} >= ? AND ${MediaStore.Video.Media.IS_PENDING} = 0",
+            arrayOf(startedSeconds.toString()), "${MediaStore.Video.Media.DATE_ADDED} ASC"
+        )?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+            val addedColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+            val takenColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_TAKEN)
+            val pathColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.RELATIVE_PATH)
+            while (cursor.moveToNext()) {
+                if (cursor.getString(pathColumn).orEmpty().contains("MyPhotoApp", ignoreCase = true)) continue
+                val addedMillis = cursor.getLong(addedColumn) * 1000L
+                val takenMillis = cursor.getLong(takenColumn).takeIf { it > 0L } ?: addedMillis
+                results += RecentVideo(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cursor.getLong(idColumn)), takenMillis)
             }
         }
         return results

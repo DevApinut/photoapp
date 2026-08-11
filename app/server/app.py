@@ -102,8 +102,56 @@ def storage_job_name(client_name: str, job_name: str, job_id: str | None) -> str
     if not job_id:
         return requested
     with closing(db()) as connection:
-        found = connection.execute("SELECT storage_name FROM backup_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if found: return found["storage_name"]
+        found = connection.execute("SELECT client_name, requested_name, storage_name FROM backup_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if found:
+            if found["client_name"] == client_name and found["requested_name"] == job_name:
+                return found["storage_name"]
+            old_parent = PHOTO_ROOT if str(found["client_name"]).strip() == "งานทั่วไป" else PHOTO_ROOT / safe_part(str(found["client_name"]))
+            new_parent = PHOTO_ROOT if client_name.strip() == "งานทั่วไป" else PHOTO_ROOT / safe_part(client_name)
+            old_path = old_parent / str(found["storage_name"])
+            occupant = connection.execute(
+                "SELECT job_id FROM backup_jobs WHERE client_name=? AND storage_name=? AND job_id<>?",
+                (client_name, requested, job_id),
+            ).fetchone()
+            requested_path = new_parent / requested
+            if occupant and requested_path.exists():
+                archived = f"{requested} (เดิม)"; archive_number = 2
+                while (new_parent / archived).exists() or connection.execute(
+                    "SELECT 1 FROM backup_jobs WHERE client_name=? AND storage_name=?", (client_name, archived)
+                ).fetchone():
+                    archived = f"{requested} (เดิม {archive_number})"; archive_number += 1
+                archived_path = new_parent / archived
+                requested_path.rename(archived_path)
+                old_prefix = requested_path.relative_to(PHOTO_ROOT).as_posix() + "/"
+                archive_prefix = archived_path.relative_to(PHOTO_ROOT).as_posix() + "/"
+                occupied_rows = connection.execute("SELECT hash, stored_path FROM uploaded_photos WHERE job_id=?", (occupant["job_id"],)).fetchall()
+                for row in occupied_rows:
+                    stored = str(row["stored_path"])
+                    if stored.startswith(old_prefix):
+                        connection.execute("UPDATE uploaded_photos SET stored_path=? WHERE hash=?",
+                                           (archive_prefix + stored[len(old_prefix):], row["hash"]))
+                connection.execute("UPDATE backup_jobs SET storage_name=? WHERE job_id=?", (archived, occupant["job_id"]))
+            candidate = requested; number = 2
+            while (new_parent / candidate).exists() and (new_parent / candidate) != old_path:
+                candidate = f"{requested} ({number})"; number += 1
+            new_path = new_parent / candidate
+            if old_path.exists() and old_path != new_path:
+                new_parent.mkdir(parents=True, exist_ok=True)
+                old_path.rename(new_path)
+                old_prefix = old_path.relative_to(PHOTO_ROOT).as_posix() + "/"
+                new_prefix = new_path.relative_to(PHOTO_ROOT).as_posix() + "/"
+                rows = connection.execute("SELECT hash, stored_path FROM uploaded_photos WHERE job_id=?", (job_id,)).fetchall()
+                for row in rows:
+                    stored = str(row["stored_path"])
+                    if stored.startswith(old_prefix):
+                        connection.execute("UPDATE uploaded_photos SET stored_path=?, client_name=?, job_name=? WHERE hash=?",
+                                           (new_prefix + stored[len(old_prefix):], client_name, job_name, row["hash"]))
+            else:
+                connection.execute("UPDATE uploaded_photos SET client_name=?, job_name=? WHERE job_id=?", (client_name, job_name, job_id))
+            connection.execute("UPDATE backup_jobs SET client_name=?, requested_name=?, storage_name=? WHERE job_id=?",
+                               (client_name, job_name, candidate, job_id))
+            connection.commit()
+            return candidate
         parent = PHOTO_ROOT if client_name.strip() == "งานทั่วไป" else PHOTO_ROOT / safe_part(client_name)
         candidate = requested; number = 2
         while (parent / candidate).exists() or connection.execute(
@@ -260,7 +308,7 @@ def download_document(document_id: str) -> FileResponse:
             for document in info.get("documents", []):
                 if isinstance(document, dict) and str(document.get("document_id")) == document_id:
                     source = info_path.parent / safe_part(str(document.get("filename", "")))
-                    if source.is_file(): return FileResponse(source, media_type="application/pdf", filename=source.name)
+                    if source.is_file(): return FileResponse(source, media_type=str(document.get("mime_type", "application/pdf")), filename=source.name)
         except (OSError, ValueError): pass
     raise HTTPException(404, "Document not found")
 
@@ -291,7 +339,7 @@ async def upload_document(
     document: Annotated[UploadFile, File()], document_id: Annotated[str, Form()], sha256: Annotated[str, Form()],
     client_name: Annotated[str, Form()], job_name: Annotated[str, Form()], location_name: Annotated[str, Form()],
     filename: Annotated[str, Form()], page_count: Annotated[int, Form()], created_at: Annotated[str, Form()],
-    job_id: Annotated[str | None, Form()] = None,
+    job_id: Annotated[str | None, Form()] = None, mime_type: Annotated[str, Form()] = "application/pdf",
 ) -> dict[str, object]:
     expected = sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected): raise HTTPException(400, "Invalid SHA-256")
@@ -306,7 +354,7 @@ async def upload_document(
         temp.replace(target)
         write_folder_info(target_dir, client_name, job_name, location_name, document_info={
             "document_id": document_id, "filename": target.name, "sha256": expected,
-            "page_count": page_count, "created_at": created_at, "size_bytes": size,
+            "page_count": page_count, "created_at": created_at, "size_bytes": size, "mime_type": mime_type,
         }, job_id=job_id)
         return {"status": "uploaded", "sha256": expected, "size_bytes": size}
     finally:

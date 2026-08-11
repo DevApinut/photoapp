@@ -19,15 +19,15 @@ $env:PYTHONPATH = $sitePackages
     --clean `
     --onefile `
     --console `
-    --name "DN-Photo-Server-V5" `
+    --name "DN-Photo-Server-V6" `
     --paths $serverDir `
     --collect-all uvicorn `
     --collect-all fastapi `
     --hidden-import app `
     --distpath $serverDir `
-    --workpath (Join-Path $serverDir "build-v5") `
+    --workpath (Join-Path $serverDir "build-v6") `
     --specpath $serverDir `
     (Join-Path $serverDir "launcher.py")
 
 Write-Host ""
-Write-Host "Created: $serverDir\DN-Photo-Server-V5.exe"
+Write-Host "Created: $serverDir\DN-Photo-Server-V6.exe"

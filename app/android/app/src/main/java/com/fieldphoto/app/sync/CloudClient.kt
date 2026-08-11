@@ -14,7 +14,7 @@ data class CloudPhoto(
     val accuracy: Float?, val sizeBytes: Long,
 )
 data class CloudFolder(val jobId: String, val clientName: String, val jobName: String, val locationName: String)
-data class CloudDocument(val id: String, val jobId: String, val clientName: String, val jobName: String, val locationName: String, val filename: String, val pageCount: Int, val createdAt: String)
+data class CloudDocument(val id: String, val jobId: String, val clientName: String, val jobName: String, val locationName: String, val filename: String, val pageCount: Int, val createdAt: String, val mimeType: String = "application/pdf")
 data class CloudNote(val id: String, val jobId: String, val clientName: String, val jobName: String, val locationName: String, val title: String, val content: String, val updatedAt: String)
 data class CloudCatalog(val folders: List<CloudFolder> = emptyList(), val photos: List<CloudPhoto> = emptyList(), val documents: List<CloudDocument> = emptyList(), val notes: List<CloudNote> = emptyList())
 
@@ -41,7 +41,7 @@ class CloudClient {
             }
             fun identity(item: JSONObject) = Triple(item.optString("client_name"), item.optString("job_name"), item.optString("location_name"))
             val folders = buildList { root.optJSONArray("folders")?.let { array -> for (i in 0 until array.length()) array.getJSONObject(i).let { item -> val id=identity(item); add(CloudFolder(jobId(item), id.first,id.second,id.third)) } } }
-            val documents = buildList { root.optJSONArray("documents")?.let { array -> for (i in 0 until array.length()) array.getJSONObject(i).let { item -> val id = identity(item); add(CloudDocument(item.optString("document_id"), jobId(item), id.first, id.second, id.third, item.optString("filename"), item.optInt("page_count"), item.optString("created_at"))) } } }
+            val documents = buildList { root.optJSONArray("documents")?.let { array -> for (i in 0 until array.length()) array.getJSONObject(i).let { item -> val id = identity(item); add(CloudDocument(item.optString("document_id"), jobId(item), id.first, id.second, id.third, item.optString("filename"), item.optInt("page_count"), item.optString("created_at"), item.optString("mime_type", "application/pdf"))) } } }
             val notes = buildList { root.optJSONArray("notes")?.let { array -> for (i in 0 until array.length()) array.getJSONObject(i).let { item -> val id = identity(item); add(CloudNote(item.optString("note_id"), jobId(item), id.first, id.second, id.third, item.optString("title"), item.optString("content"), item.optString("updated_at"))) } } }
             CloudCatalog(folders, photos, documents, notes)
         }

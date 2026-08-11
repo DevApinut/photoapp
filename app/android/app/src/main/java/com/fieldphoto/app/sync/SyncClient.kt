@@ -124,7 +124,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
 
     private fun uploadDocument(base: String, document: PendingDocument) {
         val fileBody = object : RequestBody() {
-            override fun contentType() = "application/pdf".toMediaType()
+            override fun contentType() = document.mimeType.toMediaType()
             override fun writeTo(sink: okio.BufferedSink) {
                 context.contentResolver.openInputStream(Uri.parse(document.contentUri)).use { input -> requireNotNull(input); sink.writeAll(input.source()) }
             }
@@ -135,6 +135,7 @@ class SyncClient(private val context: Context, private val dao: AppDao) {
             .addFormDataPart("job_id", document.jobId)
             .addFormDataPart("job_name", document.jobName).addFormDataPart("location_name", document.locationName)
             .addFormDataPart("filename", document.filename).addFormDataPart("page_count", document.pageCount.toString())
+            .addFormDataPart("mime_type", document.mimeType)
             .addFormDataPart("created_at", document.createdAt).build()
         http.newCall(Request.Builder().url("$base/upload-document").post(body).build()).execute().use { response ->
             if (!response.isSuccessful) throw IOException("Server ${response.code}: ${response.body?.string().orEmpty()}")

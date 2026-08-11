@@ -62,11 +62,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -93,6 +95,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.flowOf
 import java.io.File
 import java.time.OffsetDateTime
 import java.time.Instant
@@ -121,6 +124,7 @@ private sealed interface Page {
     data class CloudViewer(val photos: List<CloudPhoto>, val initialIndex: Int) : Page
     data class Camera(val place: LocationEntity, val title: String = place.name) : Page
     data object Settings : Page
+    data object FileSearch : Page
 }
 
 private data class ExternalCapture(
@@ -148,6 +152,28 @@ private fun displayDateTime(value: String?): String = value?.let {
 
 private fun localDateOf(value: String?): LocalDate? = value?.let {
     runCatching { OffsetDateTime.parse(it).toLocalDate() }.getOrNull()
+}
+
+@Composable
+private fun LocalGridThumbnail(uri: Uri, cacheKey: String, pixels: Int, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val thumbnailState by produceState<Pair<Boolean, Bitmap?>>(false to null, uri, pixels) {
+        value = true to withContext(Dispatchers.IO) {
+            runCatching { context.contentResolver.loadThumbnail(uri, android.util.Size(pixels, pixels), null) }.getOrNull()
+        }
+    }
+    val (loaded, bitmap) = thumbnailState
+    when {
+        bitmap != null -> Image(bitmap.asImageBitmap(), null, modifier, contentScale = ContentScale.Crop)
+        loaded -> {
+            val fallback = remember(uri, cacheKey, pixels) {
+                ImageRequest.Builder(context).data(uri).size(pixels, pixels).precision(Precision.INEXACT)
+                    .crossfade(false).memoryCacheKey(cacheKey).build()
+            }
+            AsyncImage(fallback, null, modifier, contentScale = ContentScale.Crop)
+        }
+        else -> Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant))
+    }
 }
 
 private fun constrainedImageOffset(offset: Offset, scale: Float, viewport: IntSize, content: IntSize): Offset {
@@ -186,6 +212,7 @@ private fun saveFolderTemplates(context: Context, templates: List<FolderTemplate
 @OptIn(ExperimentalMaterial3Api::class)
 private fun PhotoWorkApp(repo: PhotoRepository) {
     var page by remember { mutableStateOf<Page>(Page.Clients) }
+    LaunchedEffect(Unit) { repo.cleanupLegacyEmptyTestJob() }
     val history = remember { mutableStateListOf<Page>() }
     fun navigate(target: Page) { history.add(page); page = target }
     fun back() { if (history.isNotEmpty()) page = history.removeAt(history.lastIndex) else page = Page.Clients }
@@ -196,6 +223,11 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
     var showTimestamp by remember { mutableStateOf(prefs.getBoolean("show_timestamp", true)) }
     var message by remember { mutableStateOf<String?>(null) }
     var syncing by remember { mutableStateOf(false) }
+    val rootView = LocalView.current
+    DisposableEffect(syncing, rootView) {
+        rootView.keepScreenOn = syncing
+        onDispose { rootView.keepScreenOn = false }
+    }
     var syncProgress by remember { mutableStateOf<SyncProgress?>(null) }
     var syncModeDialog by remember { mutableStateOf(false) }
     var recoveryNavigationChecked by remember { mutableStateOf(false) }
@@ -249,7 +281,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
             if (page !is Page.Viewer && page !is Page.CloudViewer) TopAppBar(
                 title = { Text(when (val p = page) {
                     Page.Clients -> "งานทั้งหมด"; is Page.Jobs -> p.client.name; is Page.Places -> p.job.name
-                    is Page.Photos -> p.title; is Page.Camera -> "ถ่ายรูป — ${p.title}"; Page.Settings -> "ตั้งค่า"
+                    is Page.Photos -> p.title; is Page.Camera -> "ถ่ายรูป — ${p.title}"; Page.Settings -> "ตั้งค่า"; Page.FileSearch -> "ค้นหาไฟล์"
                     is Page.Viewer -> "รูปภาพ"; is Page.CloudJob -> "${p.jobName} — Server"; is Page.CloudPdf -> p.document.filename; is Page.CloudViewer -> "รูปบน Server"
                 }) },
                 navigationIcon = { if (page !is Page.Clients) IconButton(onClick = { back() }) { Icon(Icons.Default.ArrowBack, "กลับ") } },
@@ -267,7 +299,8 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
             when (val p = page) {
                 Page.Clients -> QuickJobsPage(repo, serverUrl,
                     openJob = { place, title -> navigate(Page.Photos(place, title)) },
-                    openCloud = { jobId, client, job -> navigate(Page.CloudJob(jobId, client, job)) })
+                    openCloud = { jobId, client, job -> navigate(Page.CloudJob(jobId, client, job)) },
+                    openFileSearch = { navigate(Page.FileSearch) })
                 is Page.Jobs -> JobsPage(repo, p.client) { navigate(Page.Places(it)) }
                 is Page.Places -> PlacesPage(repo, p.job) { navigate(Page.Photos(it)) }
                 is Page.Photos -> PhotosPage(repo, serverUrl, p.place, p.title,
@@ -286,6 +319,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 Page.Settings -> SettingsPage(serverUrl, showTimestamp,
                     saveUrl = { serverUrl = it; prefs.edit().putString("server_url", it).apply() },
                     saveTimestamp = { showTimestamp = it; prefs.edit().putBoolean("show_timestamp", it).apply() })
+                Page.FileSearch -> FileSearchPage(repo) { photo -> navigate(Page.Viewer(listOf(photo), 0)) }
             }
             if (syncing) {
                 val progress = syncProgress
@@ -340,6 +374,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
 @Composable private fun QuickJobsPage(
     repo: PhotoRepository, serverUrl: String,
     openJob: (LocationEntity, String) -> Unit, openCloud: (String, String, String) -> Unit,
+    openFileSearch: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -475,6 +510,14 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 trailingIcon = { if (jobSearch.isNotEmpty()) IconButton(onClick = { jobSearch = ""; jobPreferences.edit().remove("search").apply() }) { Icon(Icons.Default.Close, "ล้างการค้นหา") } },
                 placeholder = { Text("ค้นหาชื่องานหรือข้อความในโน้ต") }, singleLine = true
             )
+            OutlinedButton(
+                onClick = openFileSearch,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)
+            ) {
+                Icon(Icons.Default.FolderOpen, null, Modifier.size(19.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("ค้นหาไฟล์ รูปภาพ PDF หรือวิดีโอ")
+            }
             Surface(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                 shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerLow
@@ -735,7 +778,8 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
     )
     if (quickDialog) NameDialog(
         if (selectedTemplate == null) "กรอกชื่องาน" else "ชื่องานใหม่ — ${selectedTemplate!!.name}",
-        initialValue = selectedTemplate?.name.orEmpty(),
+        defaultValue = selectedTemplate?.name.orEmpty(),
+        placeholder = selectedTemplate?.name.orEmpty(),
         confirmLabel = "สร้างงาน",
         onDismiss = { quickDialog = false }
     ) { value ->
@@ -965,12 +1009,12 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     if (dialog) NameDialog(addLabel, onDismiss = { dialog = false }) { value -> scope.launch { add(value) }; dialog = false }
 }
 
-@Composable private fun NameDialog(title: String, initialValue: String = "", confirmLabel: String = "บันทึก", onDismiss: () -> Unit, save: (String) -> Unit) {
+@Composable private fun NameDialog(title: String, initialValue: String = "", defaultValue: String = initialValue, placeholder: String = "", confirmLabel: String = "บันทึก", onDismiss: () -> Unit, save: (String) -> Unit) {
     var value by remember(initialValue) { mutableStateOf(initialValue) }
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { OutlinedTextField(value, { value = it }, singleLine = true) },
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(title) }, text = { OutlinedTextField(value, { value = it }, placeholder = { if (placeholder.isNotBlank()) Text(placeholder) }, singleLine = true) },
         confirmButton = { TextButton(
-            onClick = { if (value.isNotBlank() || initialValue.isNotBlank()) save(value.trim().ifBlank { initialValue }) },
-            enabled = value.isNotBlank() || initialValue.isNotBlank()
+            onClick = { if (value.isNotBlank() || defaultValue.isNotBlank()) save(value.trim().ifBlank { defaultValue }) },
+            enabled = value.isNotBlank() || defaultValue.isNotBlank()
         ) { Text(confirmLabel) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("ยกเลิก") } })
 }
@@ -1012,6 +1056,10 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val displayPreferences = remember { context.getSharedPreferences("photo_display", Context.MODE_PRIVATE) }
     val recoveryPreferences = remember { context.getSharedPreferences("settings", Context.MODE_PRIVATE) }
     var gridColumns by remember { mutableIntStateOf(displayPreferences.getInt("columns", 2).coerceIn(1, 5)) }
+    val thumbnailPixels = when (gridColumns) { 1 -> 720; 2 -> 480; 3 -> 360; 4 -> 280; else -> 224 }
+    val overlayButtonSize = when (gridColumns) { 1 -> 40.dp; 2 -> 32.dp; 3 -> 28.dp; 4 -> 24.dp; else -> 20.dp }
+    val overlayIconSize = when (gridColumns) { 1 -> 23.dp; 2 -> 18.dp; 3 -> 16.dp; 4 -> 14.dp; else -> 12.dp }
+    val overlayOuterPadding = when (gridColumns) { 1 -> 7.dp; 2 -> 5.dp; 3 -> 4.dp; 4 -> 3.dp; else -> 2.dp }
     var selectedPhotoIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var selectedDocumentIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var documentToDelete by remember { mutableStateOf<DocumentEntity?>(null) }
@@ -1086,15 +1134,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         val uris = ArrayList(selected.map { Uri.parse(it.contentUri) })
         if (uris.isEmpty()) return
         val share = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-            type = "application/pdf"
+            type = selected.map { it.mimeType }.distinct().singleOrNull() ?: "*/*"
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
             clipData = ClipData.newUri(context.contentResolver, selected.first().filename, uris.first()).also { clips ->
                 uris.drop(1).forEach { clips.addItem(ClipData.Item(it)) }
             }
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        runCatching { context.startActivity(Intent.createChooser(share, "แชร์ PDF ${uris.size} ไฟล์")) }
-            .onFailure { Toast.makeText(context, "ไม่พบแอปที่รองรับการแชร์ PDF หลายไฟล์", Toast.LENGTH_LONG).show() }
+        runCatching { context.startActivity(Intent.createChooser(share, "แชร์ ${uris.size} ไฟล์")) }
+            .onFailure { Toast.makeText(context, "ไม่พบแอปที่รองรับการแชร์หลายไฟล์", Toast.LENGTH_LONG).show() }
     }
 
     fun deleteSelectedPhotosFromDevice() {
@@ -1173,6 +1221,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 runCatching { repo.importPdf(place.id, it) }
                     .onSuccess { pages -> Toast.makeText(context, "นำเข้า PDF $pages หน้าแล้ว", Toast.LENGTH_LONG).show() }
                     .onFailure { error -> Toast.makeText(context, "นำเข้า PDF ไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show() }
+            }
+        }
+    }
+    val videoImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let {
+            scope.launch {
+                runCatching { repo.importVideo(place.id, it) }
+                    .onSuccess { Toast.makeText(context, "เพิ่มวิดีโอแล้ว", Toast.LENGTH_LONG).show() }
+                    .onFailure { error -> Toast.makeText(context, "เพิ่มวิดีโอไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show() }
             }
         }
     }
@@ -1310,6 +1367,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         } else importAll(null, null, null)
     }
 
+    fun importOppoVideos(selected: List<Uri>) {
+        if (selected.isEmpty()) return
+        scope.launch {
+            var imported = 0
+            selected.forEach { uri -> runCatching { repo.importVideo(place.id, uri) }.onSuccess { imported++ } }
+            Toast.makeText(context, "นำเข้าวิดีโอจาก OPPO $imported ไฟล์แล้ว", Toast.LENGTH_LONG).show()
+        }
+    }
+
     LaunchedEffect(place.id) {
         val recoveryLocation = recoveryPreferences.getString("oppo_recovery_location", null)
         val recoveryStarted = recoveryPreferences.getLong("oppo_recovery_started", 0L)
@@ -1328,7 +1394,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val oppoBatchPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(50)) { selected ->
         val withStamp = pendingOppoStamp ?: false
         pendingOppoStamp = null
-        importOppoPhotos(selected.map { it to System.currentTimeMillis() }, withStamp)
+        val videos = selected.filter { context.contentResolver.getType(it)?.startsWith("video/") == true }
+        importOppoPhotos(selected.filterNot { it in videos }.map { it to System.currentTimeMillis() }, withStamp)
+        importOppoVideos(videos)
     }
 
     val externalCamera = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -1337,14 +1405,18 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             scope.launch {
                 delay(2500)
                 val mediaPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+                val videoPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
                 val canReadGallery = ContextCompat.checkSelfPermission(context, mediaPermission) == PackageManager.PERMISSION_GRANTED
+                    && ContextCompat.checkSelfPermission(context, videoPermission) == PackageManager.PERMISSION_GRANTED
                 val recent = if (canReadGallery) runCatching { repo.media.imagesAddedSince(pendingOppoStartedAt) }.getOrDefault(emptyList()) else emptyList()
-                if (recent.isNotEmpty()) {
+                val recentVideos = if (canReadGallery) runCatching { repo.media.videosAddedSince(pendingOppoStartedAt) }.getOrDefault(emptyList()) else emptyList()
+                if (recent.isNotEmpty() || recentVideos.isNotEmpty()) {
                     pendingOppoStamp = null
                     importOppoPhotos(recent.map { it.uri to it.capturedAtMillis }, withStamp)
+                    importOppoVideos(recentVideos.map { it.uri })
                 } else {
-                    Toast.makeText(context, "หาไฟล์ใหม่อัตโนมัติไม่พบ กรุณาเลือกภาพที่เพิ่งถ่าย", Toast.LENGTH_LONG).show()
-                    oppoBatchPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    Toast.makeText(context, "หาไฟล์ใหม่อัตโนมัติไม่พบ กรุณาเลือกรูปหรือวิดีโอที่เพิ่งถ่าย", Toast.LENGTH_LONG).show()
+                    oppoBatchPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                 }
             }
         }
@@ -1359,7 +1431,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 .putLong("oppo_recovery_started", pendingOppoStartedAt)
                 .putBoolean("oppo_recovery_stamp", withStamp)
                 .apply()
-            val intent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+            val stillIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+            val cameraPackage = stillIntent.resolveActivity(context.packageManager)?.packageName
+            val intent = cameraPackage?.let { context.packageManager.getLaunchIntentForPackage(it) } ?: stillIntent
             if (intent.resolveActivity(context.packageManager) == null) kotlin.error("ไม่พบแอปกล้องในเครื่อง")
             Toast.makeText(context, "ถ่ายต่อเนื่องได้เลย เสร็จแล้วใช้ปุ่มหรือท่าทางย้อนกลับของ Android", Toast.LENGTH_LONG).show()
             externalCamera.launch(intent)
@@ -1386,8 +1460,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = { selectedDocumentIds = emptySet() }) { Icon(Icons.Default.Close, "ยกเลิก") }
-                Text("เลือกแล้ว ${selectedDocumentIds.size} PDF", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                IconButton(onClick = ::shareSelectedDocuments) { Icon(Icons.Default.Share, "แชร์ PDF ที่เลือก") }
+                Text("เลือกแล้ว ${selectedDocumentIds.size} ไฟล์", Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                IconButton(onClick = ::shareSelectedDocuments) { Icon(Icons.Default.Share, "แชร์ไฟล์ที่เลือก") }
             }
         } else if (selectedPhotoIds.isNotEmpty()) {
             Row(
@@ -1447,7 +1521,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                             selectedDocumentIds = if (isSelected) selectedDocumentIds - document.id else selectedDocumentIds + document.id
                         } else {
                             val intent = Intent(Intent.ACTION_VIEW).apply {
-                                setDataAndType(Uri.parse(document.contentUri), "application/pdf")
+                                setDataAndType(Uri.parse(document.contentUri), document.mimeType)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             runCatching { context.startActivity(intent) }
@@ -1467,24 +1541,25 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                             Icon(Icons.Default.CheckCircle, "เลือกแล้ว", tint = MaterialTheme.colorScheme.primary)
                             Spacer(Modifier.width(8.dp))
                         }
-                        Icon(Icons.Default.PictureAsPdf, null, tint = MaterialTheme.colorScheme.error)
+                        Icon(if (document.mimeType.startsWith("video/")) Icons.Default.PlayCircle else Icons.Default.PictureAsPdf, null,
+                            tint = if (document.mimeType.startsWith("video/")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(document.filename, fontWeight = FontWeight.Bold)
-                            Text("PDF ${document.pageCount} หน้า • ${document.status}", style = MaterialTheme.typography.bodySmall)
+                            Text(if (document.mimeType.startsWith("video/")) "วิดีโอ • ${document.status}" else "PDF ${document.pageCount} หน้า • ${document.status}", style = MaterialTheme.typography.bodySmall)
                         }
                         if (selectedDocumentIds.isEmpty()) IconButton(onClick = {
                             val uri = Uri.parse(document.contentUri)
                             val share = Intent(Intent.ACTION_SEND).apply {
-                                type = "application/pdf"
+                                type = document.mimeType
                                 putExtra(Intent.EXTRA_STREAM, uri)
                                 clipData = ClipData.newUri(context.contentResolver, document.filename, uri)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             runCatching { context.startActivity(Intent.createChooser(share, "แชร์ ${document.filename}")) }
-                                .onFailure { Toast.makeText(context, "ไม่พบแอปสำหรับแชร์ PDF", Toast.LENGTH_SHORT).show() }
-                        }) { Icon(Icons.Default.Share, "แชร์ PDF") }
-                        if (selectedDocumentIds.isEmpty()) IconButton(onClick = { documentToDelete = document }) { Icon(Icons.Default.Delete, "ลบ PDF") }
+                                .onFailure { Toast.makeText(context, "ไม่พบแอปสำหรับแชร์ไฟล์", Toast.LENGTH_SHORT).show() }
+                        }) { Icon(Icons.Default.Share, "แชร์ไฟล์") }
+                        if (selectedDocumentIds.isEmpty()) IconButton(onClick = { documentToDelete = document }) { Icon(Icons.Default.Delete, "ลบไฟล์") }
                     }
                 }
             }
@@ -1515,49 +1590,54 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 }
             }
             gridItemsIndexed(cloudOnlyPhotos, key = { _, photo -> "cloud-${photo.hash}" }) { index, photo ->
-                ElevatedCard(
+                val thumbnailRequest = remember(photo.hash, serverUrl) {
+                    ImageRequest.Builder(context).data(CloudClient().photoUrl(serverUrl, photo.hash))
+                        .size(thumbnailPixels, thumbnailPixels).precision(Precision.INEXACT).crossfade(false)
+                        .memoryCacheKey("cloud-thumb-${photo.hash}-$thumbnailPixels").diskCacheKey("cloud-thumb-${photo.hash}-$thumbnailPixels").build()
+                }
+                Card(
                     Modifier.fillMaxWidth().aspectRatio(1f).clickable { openCloudPhoto(cloudOnlyPhotos, index) },
-                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                 ) {
                     Box(Modifier.fillMaxSize().graphicsLayer(alpha = 0.68f)) {
-                        AsyncImage(CloudClient().photoUrl(serverUrl, photo.hash), photo.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        AsyncImage(thumbnailRequest, photo.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                         Icon(
                             Icons.Default.Cloud, "อยู่บน Server เท่านั้น", tint = Color.White,
-                            modifier = Modifier.align(Alignment.TopStart).padding(7.dp)
-                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.9f), RoundedCornerShape(50)).padding(5.dp)
+                            modifier = Modifier.align(Alignment.TopStart).padding(overlayOuterPadding).size(overlayButtonSize)
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.9f), RoundedCornerShape(50)).padding((overlayButtonSize - overlayIconSize) / 2)
                         )
                     }
                 }
             }
             gridItemsIndexed(rows, key = { _, photo -> photo.id }) { index, photo ->
                 val selected = photo.id in selectedPhotoIds
-                ElevatedCard(
+                Card(
                     Modifier.fillMaxWidth().aspectRatio(1f).combinedClickable(
                         onClick = { if (selectedPhotoIds.isEmpty()) openPhoto(rows, index) else togglePhoto(photo.id) },
                         onLongClick = { togglePhoto(photo.id) }
                     )
                 ) { Box(Modifier.fillMaxSize()) {
-                    AsyncImage(Uri.parse(photo.contentUri), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    LocalGridThumbnail(Uri.parse(photo.contentUri), "local-thumb-${photo.id}-$thumbnailPixels", thumbnailPixels, Modifier.fillMaxSize())
                     if (photo.sha256 in cloudHashes && !selected) Icon(
                         Icons.Default.CloudDone, "มีทั้งในเครื่องและ Server", tint = Color.White,
-                        modifier = Modifier.align(Alignment.TopStart).padding(7.dp)
-                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.88f), RoundedCornerShape(50)).padding(5.dp)
+                        modifier = Modifier.align(Alignment.TopStart).padding(overlayOuterPadding).size(overlayButtonSize)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.88f), RoundedCornerShape(50)).padding((overlayButtonSize - overlayIconSize) / 2)
                     )
                     if (selected) {
                         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)))
                         Icon(
                             Icons.Default.CheckCircle, "เลือกแล้ว", tint = Color.White,
-                            modifier = Modifier.align(Alignment.TopStart).padding(7.dp)
-                                .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50))
+                            modifier = Modifier.align(Alignment.TopStart).padding(overlayOuterPadding).size(overlayButtonSize)
+                                .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50)).padding((overlayButtonSize - overlayIconSize) / 2)
                         )
                     }
                     if (selectedPhotoIds.isEmpty()) Box(
-                        modifier = Modifier.align(Alignment.TopEnd).padding(5.dp).size(30.dp)
+                        modifier = Modifier.align(Alignment.TopEnd).padding(overlayOuterPadding).size(overlayButtonSize)
                             .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
                             .clickable { photoDeleteOptions = photo },
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.Delete, "ลบ", tint = Color.White, modifier = Modifier.size(17.dp))
+                        Icon(Icons.Default.Delete, "ลบ", tint = Color.White, modifier = Modifier.size(overlayIconSize))
                     }
                 } }
             }
@@ -1577,7 +1657,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                     FilledIconButton(onClick = {
                         val mediaPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-                        externalCameraPermission.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, mediaPermission))
+                        val videoPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
+                        externalCameraPermission.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, mediaPermission, videoPermission))
                     }, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.CameraAlt, null, Modifier.size(22.dp)) }
                     Text("กล้อง OPPO", style = MaterialTheme.typography.labelSmall)
                 }
@@ -1616,6 +1697,12 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     Text("นำเข้า PDF", style = MaterialTheme.typography.labelSmall)
                 }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledTonalIconButton(onClick = { videoImportLauncher.launch(arrayOf("video/*")) }, modifier = Modifier.size(44.dp)) {
+                        Icon(Icons.Default.VideoLibrary, null, Modifier.size(22.dp))
+                    }
+                    Text("นำเข้าวิดีโอ", style = MaterialTheme.typography.labelSmall)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     FilledTonalIconButton(onClick = {
                         editingNote = null
                         noteTitle = ""
@@ -1631,14 +1718,15 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         }
     }
     documentToDelete?.let { document ->
+        val isVideo = document.mimeType.startsWith("video/")
         AlertDialog(
             onDismissRequest = { documentToDelete = null },
             icon = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
-            title = { Text("ลบ PDF นี้?") },
+            title = { Text(if (isVideo) "ลบวิดีโอนี้?" else "ลบ PDF นี้?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(document.filename, fontWeight = FontWeight.Bold)
-                    Text("PDF ${document.pageCount} หน้า")
+                    Text(if (isVideo) "วิดีโอ" else "PDF ${document.pageCount} หน้า")
                     if (document.status != UploadStatus.UPLOADED) {
                         Text("ไฟล์นี้ยัง Backup ไม่สำเร็จ", color = MaterialTheme.colorScheme.error)
                     }
@@ -1651,11 +1739,11 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                         documentToDelete = null
                         scope.launch {
                             runCatching { repo.removeDocument(document) }
-                                .onFailure { Toast.makeText(context, "ลบ PDF ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                                .onFailure { Toast.makeText(context, "ลบไฟล์ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                ) { Text("ลบ PDF") }
+                ) { Text(if (isVideo) "ลบวิดีโอ" else "ลบ PDF") }
             },
             dismissButton = { TextButton(onClick = { documentToDelete = null }) { Text("ยกเลิก") } }
         )
@@ -1896,12 +1984,16 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     gridItems(recoveryCandidates, key = { it.uri.toString() }) { candidate ->
                         val key = candidate.uri.toString()
                         val selected = key in selectedRecoveryUris
+                        val thumbnailRequest = remember(key) {
+                            ImageRequest.Builder(context).data(candidate.uri).size(384, 384)
+                                .precision(Precision.INEXACT).crossfade(false).memoryCacheKey("recovery-thumb-$key").build()
+                        }
                         Box(
                             Modifier.aspectRatio(1f).clickable {
                                 selectedRecoveryUris = if (selected) selectedRecoveryUris - key else selectedRecoveryUris + key
                             }
                         ) {
-                            AsyncImage(candidate.uri, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            AsyncImage(thumbnailRequest, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                             if (selected) {
                                 Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)))
                                 Icon(Icons.Default.CheckCircle, "เลือกแล้ว", tint = Color.White,
@@ -1938,6 +2030,98 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         confirmButton = { Button(onClick = { externalModeDialog = false; openSystemCamera(true) }) { Text("Time stamp + GPS") } },
         dismissButton = { OutlinedButton(onClick = { externalModeDialog = false; openSystemCamera(false) }) { Text("ต้นฉบับ") } }
     )
+}
+
+@Composable private fun FileSearchPage(repo: PhotoRepository, openPhoto: (PhotoEntity) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val preferences = remember { context.getSharedPreferences("file_search", Context.MODE_PRIVATE) }
+    var query by remember { mutableStateOf(preferences.getString("query", "").orEmpty()) }
+    var typeFilter by remember { mutableStateOf("ALL") }
+    val resultFlow = remember(query) {
+        query.trim().takeIf { it.isNotEmpty() }?.let { repo.dao.searchLocalFiles(it) } ?: flowOf(emptyList())
+    }
+    val results by resultFlow.collectAsStateWithLifecycle(emptyList())
+    val visibleResults = results.filter { item ->
+        when (typeFilter) {
+            "PHOTO" -> item.kind == "PHOTO"
+            "PDF" -> item.mimeType == "application/pdf"
+            "VIDEO" -> item.mimeType.startsWith("video/")
+            else -> true
+        }
+    }
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it; preferences.edit().putString("query", it).apply() },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            leadingIcon = { Icon(Icons.Default.Search, null) },
+            trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = ""; preferences.edit().remove("query").apply() }) { Icon(Icons.Default.Close, "ล้าง") } },
+            placeholder = { Text("พิมพ์ชื่อไฟล์ เช่น IMG, ใบงาน หรือ .pdf") },
+            singleLine = true,
+        )
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            listOf("ALL" to "ทั้งหมด", "PHOTO" to "รูป", "PDF" to "PDF", "VIDEO" to "วิดีโอ").forEach { (value, label) ->
+                FilterChip(selected = typeFilter == value, onClick = { typeFilter = value }, label = { Text(label) })
+            }
+        }
+        when {
+            query.isBlank() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("ค้นหาจากชื่อไฟล์ทั่วทุกงาน", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            visibleResults.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("ไม่พบไฟล์ที่ค้นหา") }
+            else -> LazyColumn(
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(visibleResults, key = { "${it.kind}-${it.id}" }) { item ->
+                    ElevatedCard(
+                        Modifier.fillMaxWidth().clickable {
+                            if (item.kind == "PHOTO") scope.launch { runCatching { repo.dao.photo(item.id) }.onSuccess(openPhoto) }
+                            else {
+                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(Uri.parse(item.contentUri), item.mimeType)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                runCatching { context.startActivity(intent) }
+                                    .onFailure { Toast.makeText(context, "ไม่พบแอปสำหรับเปิดไฟล์นี้", Toast.LENGTH_SHORT).show() }
+                            }
+                        }
+                    ) {
+                        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (item.kind == "PHOTO") {
+                                val request = remember(item.id, item.contentUri) {
+                                    ImageRequest.Builder(context).data(Uri.parse(item.contentUri)).size(192, 192)
+                                        .precision(Precision.INEXACT).crossfade(false).memoryCacheKey("search-thumb-${item.id}").build()
+                                }
+                                AsyncImage(request, item.filename, Modifier.size(68.dp).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
+                            } else {
+                                Box(Modifier.size(68.dp), contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        if (item.mimeType.startsWith("video/")) Icons.Default.PlayCircle else Icons.Default.PictureAsPdf,
+                                        null, Modifier.size(38.dp),
+                                        tint = if (item.mimeType.startsWith("video/")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                Text(item.filename, fontWeight = FontWeight.Bold, maxLines = 2)
+                                Text("งาน: ${item.jobName}", style = MaterialTheme.typography.bodySmall)
+                                Text("โฟลเดอร์: ${item.locationName.ifBlank { "โฟลเดอร์หลัก" }}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(displayDateTime(item.capturedAt), style = MaterialTheme.typography.labelSmall)
+                            }
+                            Icon(Icons.Default.ChevronRight, "เปิดไฟล์")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun PhotoViewer(repo: PhotoRepository, photos: List<PhotoEntity>, initialIndex: Int, onBack: () -> Unit) {
@@ -2295,6 +2479,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     openPdf: (CloudDocument) -> Unit, openPhoto: (List<CloudPhoto>, Int) -> Unit,
 ) {
     val context = LocalContext.current
+    val thumbnailPixels = 360
     val scope = rememberCoroutineScope()
     var catalog by remember { mutableStateOf(CloudCatalog()) }
     var loading by remember { mutableStateOf(true) }
@@ -2369,26 +2554,33 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 }
                 gridItems(visibleDocuments, key = { "document-${it.id}" }, span = { GridItemSpan(maxLineSpan) }) { document ->
                     Surface(
-                        Modifier.fillMaxWidth().clickable { openPdf(document) }, shape = RoundedCornerShape(14.dp), color = Color.LightGray.copy(alpha = 0.48f)
+                        Modifier.fillMaxWidth().clickable {
+                            if (document.mimeType.startsWith("video/")) {
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(CloudClient().documentUrl(serverUrl, document.id))).apply { type = document.mimeType }
+                                runCatching { context.startActivity(intent) }.onFailure { Toast.makeText(context, "ไม่พบแอปเล่นวิดีโอ", Toast.LENGTH_SHORT).show() }
+                            } else openPdf(document)
+                        }, shape = RoundedCornerShape(14.dp), color = Color.LightGray.copy(alpha = 0.48f)
                     ) {
                         Row(Modifier.padding(14.dp).graphicsLayer(alpha = 0.76f), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.PictureAsPdf, null); Spacer(Modifier.width(10.dp)); Column {
+                            Icon(if (document.mimeType.startsWith("video/")) Icons.Default.PlayCircle else Icons.Default.PictureAsPdf, null); Spacer(Modifier.width(10.dp)); Column {
                                 Text(document.filename, fontWeight = FontWeight.Bold)
-                                Text("PDF ${document.pageCount} หน้า • เปิดใน DN", style = MaterialTheme.typography.bodySmall)
+                                Text(if (document.mimeType.startsWith("video/")) "วิดีโอบน Server • แตะเพื่อเล่น" else "PDF ${document.pageCount} หน้า • เปิดใน DN", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
                 }
                 gridItemsIndexed(visiblePhotos, key = { _, item -> item.hash }) { index, cloud ->
-                    ElevatedCard(
+                    val thumbnailRequest = remember(cloud.hash, serverUrl) {
+                        ImageRequest.Builder(context).data(CloudClient().photoUrl(serverUrl, cloud.hash))
+                            .size(thumbnailPixels, thumbnailPixels).precision(Precision.INEXACT).crossfade(false)
+                            .memoryCacheKey("cloud-thumb-${cloud.hash}-$thumbnailPixels").diskCacheKey("cloud-thumb-${cloud.hash}-$thumbnailPixels").build()
+                    }
+                    Card(
                         Modifier.aspectRatio(1f).clickable { openPhoto(visiblePhotos, index) },
-                        colors = CardDefaults.elevatedCardColors(containerColor = Color.LightGray.copy(alpha = 0.58f))
+                        colors = CardDefaults.cardColors(containerColor = Color.LightGray.copy(alpha = 0.58f))
                     ) {
                         Box(Modifier.fillMaxSize().graphicsLayer(alpha = 0.76f)) {
-                            AsyncImage(
-                                CloudClient().photoUrl(serverUrl, cloud.hash), cloud.filename,
-                                Modifier.fillMaxSize(), contentScale = ContentScale.Crop
-                            )
+                            AsyncImage(thumbnailRequest, cloud.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                             Box(
                                 Modifier.align(Alignment.TopEnd).padding(7.dp).size(32.dp)
                                     .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.8f), RoundedCornerShape(50)),

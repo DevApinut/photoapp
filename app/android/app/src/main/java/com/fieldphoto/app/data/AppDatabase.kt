@@ -14,7 +14,7 @@ class Converters {
     @TypeConverter fun toStatus(value: String) = UploadStatus.valueOf(value)
 }
 
-@Database(entities = [ClientEntity::class, JobEntity::class, LocationEntity::class, PhotoEntity::class, DocumentEntity::class, NoteEntity::class], version = 2, exportSchema = false)
+@Database(entities = [ClientEntity::class, JobEntity::class, LocationEntity::class, PhotoEntity::class, DocumentEntity::class, NoteEntity::class], version = 3, exportSchema = false)
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun dao(): AppDao
@@ -29,7 +29,12 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_notes_status ON notes(status)")
             }
         }
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE documents ADD COLUMN mimeType TEXT NOT NULL DEFAULT 'application/pdf'")
+            }
+        }
         fun create(context: Context) = Room.databaseBuilder(context, AppDatabase::class.java, "photo-work.sqlite3")
-            .addMigrations(MIGRATION_1_2).fallbackToDestructiveMigration().build()
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3).fallbackToDestructiveMigration().build()
     }
 }
