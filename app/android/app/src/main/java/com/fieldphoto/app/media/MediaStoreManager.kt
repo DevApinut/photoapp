@@ -124,7 +124,8 @@ class MediaStoreManager(private val context: Context) {
         val parts = uri.pathSegments
         return uri.scheme == "content" && uri.authority == MediaStore.AUTHORITY &&
             parts.none { it.equals("picker", ignoreCase = true) } &&
-            parts.size == 4 && parts[1] == "images" && parts[2] == "media" && parts[3].toLongOrNull() != null
+            parts.size >= 3 && parts.lastOrNull()?.toLongOrNull() != null &&
+            parts.any { it == "images" || it == "video" || it == "downloads" }
     }
 
     fun replaceContent(source: Uri, target: Uri) {

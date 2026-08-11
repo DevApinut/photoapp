@@ -81,6 +81,7 @@ interface AppDao {
     @Query("SELECT * FROM locations WHERE jobId = :jobId AND name = '' LIMIT 1")
     suspend fun rootLocation(jobId: String): LocationEntity?
     @Query("SELECT * FROM photos WHERE id = :id") suspend fun photo(id: String): PhotoEntity
+    @Query("SELECT EXISTS(SELECT 1 FROM photos WHERE contentUri=:contentUri)") suspend fun photoUriExists(contentUri: String): Boolean
     @Query("UPDATE photos SET status = :status, lastError = :error WHERE id = :id")
     suspend fun setStatus(id: String, status: UploadStatus, error: String? = null)
     @Query("UPDATE photos SET locationId=:locationId, status='WAITING', lastError=NULL WHERE id IN (:ids)")
@@ -96,6 +97,7 @@ interface AppDao {
     @Query("SELECT * FROM documents WHERE locationId=:locationId ORDER BY createdAt DESC") fun documents(locationId: String): Flow<List<DocumentEntity>>
     @Query("SELECT * FROM notes WHERE locationId=:locationId ORDER BY updatedAt DESC") fun notes(locationId: String): Flow<List<NoteEntity>>
     @Query("DELETE FROM documents WHERE id=:id") suspend fun deleteDocument(id: String)
+    @Query("SELECT EXISTS(SELECT 1 FROM documents WHERE contentUri=:contentUri)") suspend fun documentUriExists(contentUri: String): Boolean
     @Query("DELETE FROM notes WHERE id=:id") suspend fun deleteNote(id: String)
     @Query("UPDATE notes SET title=:title, content=:content, updatedAt=:updatedAt, status='WAITING', lastError=NULL WHERE id=:id")
     suspend fun updateNote(id: String, title: String, content: String, updatedAt: String)

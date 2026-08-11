@@ -233,22 +233,26 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
 
     suspend fun jobBackupSummary(jobId: String): BackupSummary = withContext(Dispatchers.IO) {
         val photos = dao.locationsNow(jobId).flatMap { dao.photosNow(it.id) }
+        val documents = dao.locationsNow(jobId).flatMap { dao.documentsNow(it.id) }
+        val notes = dao.locationsNow(jobId).flatMap { dao.notesNow(it.id) }
         BackupSummary(
-            waiting = photos.count { it.status == UploadStatus.WAITING },
-            failed = photos.count { it.status == UploadStatus.ERROR },
-            uploaded = photos.count { it.status == UploadStatus.UPLOADED },
+            waiting = photos.count { it.status == UploadStatus.WAITING } + documents.count { it.status == UploadStatus.WAITING } + notes.count { it.status == UploadStatus.WAITING },
+            failed = photos.count { it.status == UploadStatus.ERROR } + documents.count { it.status == UploadStatus.ERROR } + notes.count { it.status == UploadStatus.ERROR },
+            uploaded = photos.count { it.status == UploadStatus.UPLOADED } + documents.count { it.status == UploadStatus.UPLOADED } + notes.count { it.status == UploadStatus.UPLOADED },
         )
     }
 
     suspend fun jobDeleteApproval(job: JobEntity): IntentSender? = withContext(Dispatchers.IO) {
-        val uris = dao.locationsNow(job.id).flatMap { dao.photosNow(it.id) }
-            .map { Uri.parse(it.contentUri) }.filter { media.hasContent(it) }
+        val folders = dao.locationsNow(job.id)
+        val uris = folders.flatMap { dao.photosNow(it.id).map { photo -> Uri.parse(photo.contentUri) } +
+            dao.documentsNow(it.id).map { document -> Uri.parse(document.contentUri) } }.filter { media.hasContent(it) }
         createBatchDeleteApproval(uris)
     }
 
     suspend fun jobsDeleteApproval(jobs: List<JobEntity>): IntentSender? = withContext(Dispatchers.IO) {
-        val uris = jobs.flatMap { job -> dao.locationsNow(job.id).flatMap { dao.photosNow(it.id) } }
-            .map { Uri.parse(it.contentUri) }.filter { media.hasContent(it) }
+        val uris = jobs.flatMap { job -> dao.locationsNow(job.id).flatMap { folder ->
+            dao.photosNow(folder.id).map { Uri.parse(it.contentUri) } + dao.documentsNow(folder.id).map { Uri.parse(it.contentUri) }
+        } }.filter { media.hasContent(it) }
         createBatchDeleteApproval(uris)
     }
 
@@ -257,8 +261,9 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
     }
 
     suspend fun folderDeleteApproval(folder: LocationEntity): IntentSender? = withContext(Dispatchers.IO) {
-        val uris = dao.folderTree(folder.jobId, folder.name, "${folder.name}/%")
-            .flatMap { dao.photosNow(it.id) }.map { Uri.parse(it.contentUri) }.filter { media.hasContent(it) }
+        val uris = dao.folderTree(folder.jobId, folder.name, "${folder.name}/%").flatMap { item ->
+            dao.photosNow(item.id).map { Uri.parse(it.contentUri) } + dao.documentsNow(item.id).map { Uri.parse(it.contentUri) }
+        }.filter { media.hasContent(it) }
         createBatchDeleteApproval(uris)
     }
 
@@ -516,6 +521,19 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
         } catch (error: Throwable) { resolver.delete(target, null, null); throw error }
     }
 
+    suspend fun attachVideo(locationId: String, source: Uri) = withContext(Dispatchers.IO) {
+        if (dao.documentUriExists(source.toString())) return@withContext
+        val resolver = context.contentResolver
+        val mimeType = resolver.getType(source)?.takeIf { it.startsWith("video/") } ?: "video/mp4"
+        val filename = resolver.query(source, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
+        }?.takeIf { it.isNotBlank() } ?: "VIDEO_${OffsetDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.mp4"
+        dao.insertDocument(DocumentEntity(
+            id = UUID.randomUUID().toString(), locationId = locationId, contentUri = source.toString(), filename = filename,
+            sha256 = media.sha256(source), pageCount = 0, createdAt = now(), mimeType = mimeType
+        ))
+    }
+
     suspend fun addNote(locationId: String, title: String, content: String) = withContext(Dispatchers.IO) {
         dao.insertNote(NoteEntity(UUID.randomUUID().toString(), locationId, title.trim().ifBlank { "โน้ต" }, content.trim(), now()))
     }
@@ -525,7 +543,20 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
     }
 
     suspend fun removeDocument(document: DocumentEntity) = withContext(Dispatchers.IO) {
-        runCatching { context.contentResolver.delete(Uri.parse(document.contentUri), null, null) }
+        val uri = Uri.parse(document.contentUri)
+        try {
+            val deleted = context.contentResolver.delete(uri, null, null)
+            if (deleted <= 0 && uri.authority == MediaStore.AUTHORITY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                throw MediaDeleteApproval(MediaStore.createDeleteRequest(context.contentResolver, listOf(uri)).intentSender)
+            }
+        } catch (error: android.app.RecoverableSecurityException) {
+            throw MediaDeleteApproval(error.userAction.actionIntent.intentSender)
+        } catch (error: SecurityException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && uri.authority == MediaStore.AUTHORITY) {
+                throw MediaDeleteApproval(MediaStore.createDeleteRequest(context.contentResolver, listOf(uri)).intentSender)
+            }
+            throw error
+        }
         dao.deleteDocument(document.id)
     }
 }

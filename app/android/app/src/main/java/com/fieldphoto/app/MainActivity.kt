@@ -86,6 +86,7 @@ import com.fieldphoto.app.sync.CloudPhoto
 import com.fieldphoto.app.sync.CloudCatalog
 import com.fieldphoto.app.sync.CloudDocument
 import com.fieldphoto.app.media.RecentImage
+import com.fieldphoto.app.media.RecentVideo
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
@@ -899,11 +900,11 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 val backup = batchDeleteSummary
                 if (backup != null && backup.needsAttention > 0) {
                     Text("คำเตือน: ยัง Backup ไม่ครบ", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-                    if (backup.waiting > 0) Text("• ยังไม่ Backup ${backup.waiting} รูป")
-                    if (backup.failed > 0) Text("• Backup ผิดพลาด ${backup.failed} รูป")
+                    if (backup.waiting > 0) Text("• ยังไม่ Backup ${backup.waiting} รายการ")
+                    if (backup.failed > 0) Text("• Backup ผิดพลาด ${backup.failed} รายการ")
                 }
-                Text("งานและโฟลเดอร์ที่เลือกจะถูกลบจาก DN รูปที่ DN สร้างจะถูกลบจาก Gallery ด้วย")
-                Text("รูปต้นฉบับที่เคยนำเข้าจาก Gallery จะยังอยู่ใน Gallery ตามเดิม")
+                Text("งาน โฟลเดอร์ รูป วิดีโอ PDF และโน้ตที่เลือกจะถูกลบจาก DN")
+                Text("ไฟล์ MediaStore ที่ DN จัดการได้จะถูกลบจาก Gallery/เครื่องด้วย โดย Android จะถามยืนยันครั้งเดียว")
                 Text("การดำเนินการนี้ย้อนกลับไม่ได้", fontWeight = FontWeight.Bold)
             }
         },
@@ -948,10 +949,10 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (backup != null && backup.needsAttention > 0) {
                         Text("คำเตือน: งานนี้ยัง Backup ไม่ครบ", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
-                        if (backup.waiting > 0) Text("• ยังไม่ Backup ${backup.waiting} รูป")
-                        if (backup.failed > 0) Text("• Backup ผิดพลาด ${backup.failed} รูป")
+                        if (backup.waiting > 0) Text("• ยังไม่ Backup ${backup.waiting} รายการ")
+                        if (backup.failed > 0) Text("• Backup ผิดพลาด ${backup.failed} รายการ")
                     }
-                    Text("งานและรูปที่ DN สร้างจะถูกลบ รูปต้นฉบับที่นำเข้าจะถูกเอาออกจาก DN แต่ยังเก็บอยู่ใน Gallery")
+                    Text("งาน รูป วิดีโอ PDF และโน้ตจะถูกลบจาก DN ไฟล์ที่อยู่ใน MediaStore จะถูกลบจาก Gallery/เครื่องหลังยืนยันกับ Android")
                 }
             },
             confirmButton = {
@@ -1067,6 +1068,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var photoDeleteOptions by remember { mutableStateOf<PhotoEntity?>(null) }
     var showSelectedDeleteOptions by remember { mutableStateOf(false) }
     var recoveryCandidates by remember { mutableStateOf<List<RecentImage>>(emptyList()) }
+    var recoveryVideoCandidates by remember { mutableStateOf<List<RecentVideo>>(emptyList()) }
     var selectedRecoveryUris by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showRecoveryDialog by remember { mutableStateOf(false) }
     var recoveryWithStamp by remember { mutableStateOf(false) }
@@ -1186,11 +1188,22 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         }
     }
     var pendingPhotoDelete by remember { mutableStateOf<PhotoEntity?>(null) }
+    var pendingDocumentDelete by remember { mutableStateOf<DocumentEntity?>(null) }
     val mediaDeleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val photo = pendingPhotoDelete
         pendingPhotoDelete = null
         if (result.resultCode == Activity.RESULT_OK && photo != null) {
             scope.launch { repo.forgetPhoto(photo.id) }
+        }
+    }
+    val documentDeleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val document = pendingDocumentDelete
+        pendingDocumentDelete = null
+        if (result.resultCode == Activity.RESULT_OK && document != null) {
+            scope.launch {
+                repo.dao.deleteDocument(document.id)
+                Toast.makeText(context, if (document.mimeType.startsWith("video/")) "ลบวิดีโอออกจาก DN และ Gallery แล้ว" else "ลบไฟล์แล้ว", Toast.LENGTH_LONG).show()
+            }
         }
     }
     val documentScanner = remember {
@@ -1224,10 +1237,14 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         }
     }
-    val videoImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val videoImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val uri = result.data?.data.takeIf { result.resultCode == Activity.RESULT_OK }
         uri?.let {
             scope.launch {
-                runCatching { repo.importVideo(place.id, it) }
+                runCatching {
+                    runCatching { context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                    repo.attachVideo(place.id, it)
+                }
                     .onSuccess { Toast.makeText(context, "เพิ่มวิดีโอแล้ว", Toast.LENGTH_LONG).show() }
                     .onFailure { error -> Toast.makeText(context, "เพิ่มวิดีโอไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show() }
             }
@@ -1349,8 +1366,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     }
                         .onSuccess { imported++ }
                 }
-                recoveryPreferences.edit().remove("oppo_recovery_location").remove("oppo_recovery_started")
-                    .remove("oppo_recovery_stamp").apply()
+                // Keep the marker until the next recovery scan. OPPO may publish the
+                // remaining burst photos/videos to MediaStore after this first import.
                 Toast.makeText(context, "นำเข้ารูปจาก OPPO $imported รูปแล้ว", Toast.LENGTH_LONG).show()
             }
         }
@@ -1371,22 +1388,39 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         if (selected.isEmpty()) return
         scope.launch {
             var imported = 0
-            selected.forEach { uri -> runCatching { repo.importVideo(place.id, uri) }.onSuccess { imported++ } }
+            selected.forEach { uri -> runCatching { repo.attachVideo(place.id, uri) }.onSuccess { imported++ } }
             Toast.makeText(context, "นำเข้าวิดีโอจาก OPPO $imported ไฟล์แล้ว", Toast.LENGTH_LONG).show()
         }
     }
 
     LaunchedEffect(place.id) {
+        // Give the restored ActivityResult callback first chance to auto-import.
+        // ColorOS may kill DN while its camera is open, so the callback and this
+        // recovery effect can both be recreated at nearly the same time.
+        delay(1500)
+        var returnWaits = 0
+        while (recoveryPreferences.getBoolean("oppo_recovery_returning", false) && returnWaits < 30) {
+            delay(500)
+            returnWaits++
+        }
         val recoveryLocation = recoveryPreferences.getString("oppo_recovery_location", null)
         val recoveryStarted = recoveryPreferences.getLong("oppo_recovery_started", 0L)
         if (recoveryLocation == place.id && recoveryStarted > 0L) {
-            val mediaPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-            if (ContextCompat.checkSelfPermission(context, mediaPermission) == PackageManager.PERMISSION_GRANTED) {
+            val imagePermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+            val canReadImages = ContextCompat.checkSelfPermission(context, imagePermission) == PackageManager.PERMISSION_GRANTED
+            if (canReadImages) {
                 delay(700)
-                recoveryCandidates = runCatching { repo.media.imagesAddedSince(recoveryStarted) }.getOrDefault(emptyList()).takeLast(100)
+                recoveryCandidates = runCatching { repo.media.imagesAddedSince(recoveryStarted) }
+                    .getOrDefault(emptyList()).filterNot { repo.dao.photoUriExists(it.uri.toString()) }.takeLast(100)
+                recoveryVideoCandidates = emptyList()
                 recoveryWithStamp = recoveryPreferences.getBoolean("oppo_recovery_stamp", false)
                 selectedRecoveryUris = emptySet()
-                showRecoveryDialog = recoveryCandidates.isNotEmpty()
+                showRecoveryDialog = recoveryCandidates.isNotEmpty() || recoveryVideoCandidates.isNotEmpty()
+                if (!showRecoveryDialog && System.currentTimeMillis() - recoveryStarted > 10 * 60 * 1000L) {
+                    recoveryPreferences.edit().remove("oppo_recovery_location")
+                        .remove("oppo_recovery_started").remove("oppo_recovery_stamp")
+                        .remove("oppo_recovery_returning").apply()
+                }
             }
         }
     }
@@ -1394,29 +1428,39 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val oppoBatchPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(50)) { selected ->
         val withStamp = pendingOppoStamp ?: false
         pendingOppoStamp = null
-        val videos = selected.filter { context.contentResolver.getType(it)?.startsWith("video/") == true }
-        importOppoPhotos(selected.filterNot { it in videos }.map { it to System.currentTimeMillis() }, withStamp)
-        importOppoVideos(videos)
+        importOppoPhotos(selected.map { it to System.currentTimeMillis() }, withStamp)
     }
 
     val externalCamera = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        if (pendingOppoStamp != null) {
-            val withStamp = pendingOppoStamp ?: false
+        val savedLocation = recoveryPreferences.getString("oppo_recovery_location", null)
+        val savedStartedAt = recoveryPreferences.getLong("oppo_recovery_started", 0L)
+        if (savedLocation == place.id && savedStartedAt > 0L) {
+            val withStamp = pendingOppoStamp ?: recoveryPreferences.getBoolean("oppo_recovery_stamp", false)
+            val startedAt = pendingOppoStartedAt.takeIf { it > 0L } ?: savedStartedAt
+            recoveryPreferences.edit().putBoolean("oppo_recovery_returning", true).apply()
             scope.launch {
-                delay(2500)
                 val mediaPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-                val videoPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
-                val canReadGallery = ContextCompat.checkSelfPermission(context, mediaPermission) == PackageManager.PERMISSION_GRANTED
-                    && ContextCompat.checkSelfPermission(context, videoPermission) == PackageManager.PERMISSION_GRANTED
-                val recent = if (canReadGallery) runCatching { repo.media.imagesAddedSince(pendingOppoStartedAt) }.getOrDefault(emptyList()) else emptyList()
-                val recentVideos = if (canReadGallery) runCatching { repo.media.videosAddedSince(pendingOppoStartedAt) }.getOrDefault(emptyList()) else emptyList()
-                if (recent.isNotEmpty() || recentVideos.isNotEmpty()) {
+                val canReadImages = ContextCompat.checkSelfPermission(context, mediaPermission) == PackageManager.PERMISSION_GRANTED
+                var recent = emptyList<RecentImage>()
+                if (canReadImages) {
+                    delay(2500)
+                    recent = runCatching { repo.media.imagesAddedSince(startedAt) }.getOrDefault(emptyList())
+                        .distinctBy { it.uri.toString() }.sortedBy { it.capturedAtMillis }
+                }
+                if (recent.isNotEmpty()) {
                     pendingOppoStamp = null
                     importOppoPhotos(recent.map { it.uri to it.capturedAtMillis }, withStamp)
-                    importOppoVideos(recentVideos.map { it.uri })
+                    recoveryPreferences.edit().remove("oppo_recovery_location").remove("oppo_recovery_started")
+                        .remove("oppo_recovery_stamp").remove("oppo_recovery_returning").apply()
                 } else {
-                    Toast.makeText(context, "หาไฟล์ใหม่อัตโนมัติไม่พบ กรุณาเลือกรูปหรือวิดีโอที่เพิ่งถ่าย", Toast.LENGTH_LONG).show()
-                    oppoBatchPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                    recoveryPreferences.edit().remove("oppo_recovery_returning").apply()
+                    if (canReadImages) {
+                        Toast.makeText(context, "หาไฟล์ใหม่อัตโนมัติไม่พบ กรุณาเลือกภาพที่เพิ่งถ่าย", Toast.LENGTH_LONG).show()
+                        oppoBatchPicker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    } else {
+                        pendingOppoStamp = null
+                        Toast.makeText(context, "ต้องอนุญาตเข้าถึงรูปเพื่อรับรูปจากกล้องอัตโนมัติ", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
@@ -1430,10 +1474,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 .putString("oppo_recovery_location", place.id)
                 .putLong("oppo_recovery_started", pendingOppoStartedAt)
                 .putBoolean("oppo_recovery_stamp", withStamp)
+                .putBoolean("oppo_recovery_returning", false)
                 .apply()
-            val stillIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
-            val cameraPackage = stillIntent.resolveActivity(context.packageManager)?.packageName
-            val intent = cameraPackage?.let { context.packageManager.getLaunchIntentForPackage(it) } ?: stillIntent
+            val intent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
             if (intent.resolveActivity(context.packageManager) == null) kotlin.error("ไม่พบแอปกล้องในเครื่อง")
             Toast.makeText(context, "ถ่ายต่อเนื่องได้เลย เสร็จแล้วใช้ปุ่มหรือท่าทางย้อนกลับของ Android", Toast.LENGTH_LONG).show()
             externalCamera.launch(intent)
@@ -1657,8 +1700,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                     FilledIconButton(onClick = {
                         val mediaPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-                        val videoPermission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
-                        externalCameraPermission.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, mediaPermission, videoPermission))
+                        externalCameraPermission.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION, mediaPermission))
                     }, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.CameraAlt, null, Modifier.size(22.dp)) }
                     Text("กล้อง OPPO", style = MaterialTheme.typography.labelSmall)
                 }
@@ -1697,7 +1739,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     Text("นำเข้า PDF", style = MaterialTheme.typography.labelSmall)
                 }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    FilledTonalIconButton(onClick = { videoImportLauncher.launch(arrayOf("video/*")) }, modifier = Modifier.size(44.dp)) {
+                    FilledTonalIconButton(onClick = {
+                        videoImportLauncher.launch(Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI).apply { type = "video/*" })
+                    }, modifier = Modifier.size(44.dp)) {
                         Icon(Icons.Default.VideoLibrary, null, Modifier.size(22.dp))
                     }
                     Text("นำเข้าวิดีโอ", style = MaterialTheme.typography.labelSmall)
@@ -1739,7 +1783,12 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                         documentToDelete = null
                         scope.launch {
                             runCatching { repo.removeDocument(document) }
-                                .onFailure { Toast.makeText(context, "ลบไฟล์ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+                                .onFailure { error ->
+                                    if (error is MediaDeleteApproval) {
+                                        pendingDocumentDelete = document
+                                        documentDeleteApproval.launch(IntentSenderRequest.Builder(error.sender).build())
+                                    } else Toast.makeText(context, "ลบไฟล์ไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show()
+                                }
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
@@ -1936,7 +1985,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
         AlertDialog(
             onDismissRequest = { folderToDelete = null },
             title = { Text("ลบโฟลเดอร์ ${folder.name.substringAfterLast('/')}?") },
-            text = { Text("โฟลเดอร์ย่อยและรูปทั้งหมดข้างในจะถูกลบออกจากแอปและ Gallery การดำเนินการนี้ย้อนกลับไม่ได้") },
+            text = { Text("โฟลเดอร์ย่อย รูป วิดีโอ PDF และโน้ตทั้งหมดข้างในจะถูกลบออกจาก DN และไฟล์ MediaStore จะถูกลบจาก Gallery/เครื่อง การดำเนินการนี้ย้อนกลับไม่ได้") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -1963,10 +2012,10 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     }
     if (showRecoveryDialog) AlertDialog(
         onDismissRequest = { showRecoveryDialog = false },
-        title = { Text("พบรูปที่ยังไม่ได้นำเข้างาน") },
+        title = { Text("พบรูปหรือวิดีโอที่ยังไม่ได้นำเข้างาน") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("เลือกรูปที่เป็นของงานนี้เท่านั้น รูปที่ไม่เลือกจะไม่ถูกนำเข้า")
+                Text("เลือกไฟล์ที่เป็นของงานนี้เท่านั้น ไฟล์ที่ไม่เลือกจะไม่ถูกนำเข้า")
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(checked = recoveryWithStamp, onCheckedChange = { recoveryWithStamp = it })
                     Spacer(Modifier.width(8.dp))
@@ -2001,26 +2050,53 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                             }
                         }
                     }
+                    gridItems(recoveryVideoCandidates, key = { "video-${it.uri}" }) { candidate ->
+                        val key = candidate.uri.toString()
+                        val selected = key in selectedRecoveryUris
+                        val thumbnailRequest = remember(key) {
+                            ImageRequest.Builder(context).data(candidate.uri).size(384, 384)
+                                .precision(Precision.INEXACT).crossfade(false).memoryCacheKey("recovery-video-$key").build()
+                        }
+                        Box(
+                            Modifier.aspectRatio(1f).clickable {
+                                selectedRecoveryUris = if (selected) selectedRecoveryUris - key else selectedRecoveryUris + key
+                            }
+                        ) {
+                            AsyncImage(thumbnailRequest, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            Icon(Icons.Default.PlayCircle, "วิดีโอ", tint = Color.White,
+                                modifier = Modifier.align(Alignment.Center).size(34.dp))
+                            if (selected) {
+                                Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)))
+                                Icon(Icons.Default.CheckCircle, "เลือกแล้ว", tint = Color.White,
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp))
+                            }
+                        }
+                    }
                 }
-                Text("เลือกแล้ว ${selectedRecoveryUris.size}/${recoveryCandidates.size} รูป", fontWeight = FontWeight.Bold)
+                Text("เลือกแล้ว ${selectedRecoveryUris.size}/${recoveryCandidates.size + recoveryVideoCandidates.size} ไฟล์", fontWeight = FontWeight.Bold)
+                Text("Timestamp ใช้กับรูปเท่านั้น วิดีโอจะนำเข้าต้นฉบับ", style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     val selected = recoveryCandidates.filter { it.uri.toString() in selectedRecoveryUris }
+                    val selectedVideos = recoveryVideoCandidates.filter { it.uri.toString() in selectedRecoveryUris }
                     showRecoveryDialog = false
+                    recoveryPreferences.edit().remove("oppo_recovery_location").remove("oppo_recovery_started")
+                        .remove("oppo_recovery_stamp").remove("oppo_recovery_returning").apply()
                     importOppoPhotos(selected.map { it.uri to it.capturedAtMillis }, recoveryWithStamp, useCurrentLocation = false)
+                    importOppoVideos(selectedVideos.map { it.uri })
                 },
                 enabled = selectedRecoveryUris.isNotEmpty()
-            ) { Text("นำเข้ารูปที่เลือก") }
+            ) { Text("นำเข้าไฟล์ที่เลือก") }
         },
         dismissButton = {
             TextButton(onClick = {
                 showRecoveryDialog = false
                 recoveryPreferences.edit().remove("oppo_recovery_location").remove("oppo_recovery_started")
-                    .remove("oppo_recovery_stamp").apply()
-            }) { Text("ไม่ใช่รูปของงานนี้") }
+                    .remove("oppo_recovery_stamp").remove("oppo_recovery_returning").apply()
+            }) { Text("ไม่ใช่ไฟล์ของงานนี้") }
         }
     )
     if (externalModeDialog) AlertDialog(
