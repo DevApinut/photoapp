@@ -2520,6 +2520,20 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var imageContent by remember { mutableStateOf(IntSize.Zero) }
     var edgePreview by remember { mutableFloatStateOf(0f) }
     var showInfo by remember { mutableStateOf(false) }
+    var showActions by remember { mutableStateOf(false) }
+    var showRename by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showMove by remember { mutableStateOf(false) }
+    var moveTargets by remember { mutableStateOf<List<MoveTarget>>(emptyList()) }
+    var moveJobId by remember { mutableStateOf<String?>(null) }
+    var movePath by remember { mutableStateOf("") }
+    var pendingDeleteApproval by remember { mutableStateOf(false) }
+    val deleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK && pendingDeleteApproval) {
+            pendingDeleteApproval = false
+            scope.launch { repo.forgetPhoto(photo.id); onBack() }
+        } else pendingDeleteApproval = false
+    }
     LaunchedEffect(pagerState.currentPage) { imageScale = 1f; imageOffset = Offset.Zero; edgePreview = 0f; showInfo = false }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         scope.launch {
@@ -2645,6 +2659,11 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             modifier = Modifier.align(Alignment.TopEnd).padding(12.dp).background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
         ) { Icon(Icons.Default.Info, "ข้อมูลรูป", tint = Color.White) }
 
+        IconButton(
+            onClick = { showActions = true },
+            modifier = Modifier.align(Alignment.TopEnd).padding(top = 64.dp, end = 12.dp).background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
+        ) { Icon(Icons.Default.MoreVert, "จัดการรูป", tint = Color.White) }
+
         Text(
             "${pagerState.currentPage + 1} / ${photos.size}",
             color = Color.White,
@@ -2665,6 +2684,83 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 TextButton(onClick = { imageScale = 1f; imageOffset = Offset.Zero }) { Text("รีเซ็ต", color = Color.White) }
             }
         }
+    }
+
+    if (showActions) AlertDialog(
+        onDismissRequest = { showActions = false }, title = { Text("จัดการรูปนี้") },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (photo.relativePath.contains("MyPhotoApp", true)) OutlinedButton(
+                onClick = { showActions = false; showRename = true }, Modifier.fillMaxWidth()
+            ) { Icon(Icons.Default.Edit, null); Spacer(Modifier.width(8.dp)); Text("เปลี่ยนชื่อ") }
+            OutlinedButton(onClick = {
+                showActions = false
+                scope.launch {
+                    val jobs = repo.dao.allJobsNow().associateBy { it.id }
+                    moveTargets = repo.dao.allLocationsNow().mapNotNull { location -> jobs[location.jobId]?.let { MoveTarget(it, location) } }
+                    moveJobId = null; movePath = ""; showMove = true
+                }
+            }, Modifier.fillMaxWidth()) { Icon(Icons.Default.DriveFileMove, null); Spacer(Modifier.width(8.dp)); Text("ย้ายรูป") }
+            Button(onClick = { showActions = false; showDeleteConfirm = true }, Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
+                Icon(Icons.Default.Delete, null); Spacer(Modifier.width(8.dp)); Text("ลบรูป")
+            }
+        } }, confirmButton = {}, dismissButton = { TextButton(onClick = { showActions = false }) { Text("ปิด") } }
+    )
+    if (showRename) RenameDialog("เปลี่ยนชื่อรูป", photo.filename.substringBeforeLast('.'), { showRename = false }) { value ->
+        scope.launch { runCatching { repo.renamePhoto(photo, value) }
+            .onSuccess { showRename = false; Toast.makeText(context, "เปลี่ยนชื่อแล้ว", Toast.LENGTH_SHORT).show() }
+            .onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+    }
+    if (showDeleteConfirm) AlertDialog(
+        onDismissRequest = { showDeleteConfirm = false }, title = { Text("ลบรูปนี้?") },
+        text = { Text("รูปจะถูกลบออกจาก DN และ Gallery การดำเนินการนี้ย้อนกลับไม่ได้") },
+        confirmButton = { Button(onClick = {
+            showDeleteConfirm = false
+            scope.launch { runCatching { repo.deletePhoto(photo.id) }.onSuccess { onBack() }.onFailure { error ->
+                if (error is MediaDeleteApproval) {
+                    pendingDeleteApproval = true
+                    deleteApproval.launch(IntentSenderRequest.Builder(error.sender).build())
+                } else Toast.makeText(context, "ลบไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show()
+            } }
+        }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("ลบ") } },
+        dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("ยกเลิก") } }
+    )
+    if (showMove) {
+        val browseJob = moveJobId?.let { id -> moveTargets.firstOrNull { it.job.id == id }?.job }
+        val current = moveJobId?.let { jobId -> moveTargets.firstOrNull { it.job.id == jobId && it.location.name == movePath } }
+        val jobs = moveTargets.map { it.job }.distinctBy { it.id }.sortedBy { it.name.lowercase() }
+        val prefix = if (movePath.isBlank()) "" else "$movePath/"
+        val children = moveJobId?.let { jobId -> moveTargets.filter {
+            it.job.id == jobId && it.location.name.startsWith(prefix) && it.location.name != movePath &&
+                !it.location.name.removePrefix(prefix).contains('/')
+        }.sortedBy { it.location.name.lowercase() } }.orEmpty()
+        fun moveBack() { if (moveJobId == null) showMove = false else if (movePath.isBlank()) moveJobId = null else movePath = movePath.substringBeforeLast('/', "") }
+        AlertDialog(
+            onDismissRequest = { showMove = false }, title = { Text("ย้ายรูป") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = ::moveBack) { Icon(Icons.Default.ArrowBack, "ย้อนกลับ") }
+                    Column { Text(browseJob?.name ?: "เลือกงาน", fontWeight = FontWeight.Bold)
+                        if (browseJob != null) Text(movePath.ifBlank { "โฟลเดอร์หลัก" }, style = MaterialTheme.typography.bodySmall) }
+                }
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 380.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (moveJobId == null) items(jobs, key = { it.id }) { job ->
+                        ListItem(headlineContent = { Text(job.name) }, leadingContent = { Icon(Icons.Default.Work, null) },
+                            trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable { moveJobId = job.id; movePath = "" })
+                    } else items(children, key = { it.location.id }) { target ->
+                        ListItem(headlineContent = { Text(target.location.name.substringAfterLast('/')) }, leadingContent = { Icon(Icons.Default.Folder, null) },
+                            trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable { movePath = target.location.name })
+                    }
+                }
+            } },
+            confirmButton = { Button(enabled = current != null && current.location.id != photo.locationId, onClick = {
+                val target = current ?: return@Button
+                scope.launch { runCatching { repo.movePhotos(listOf(photo.id), target.location.id) }
+                    .onSuccess { showMove = false; Toast.makeText(context, "ย้ายรูปแล้ว", Toast.LENGTH_SHORT).show(); onBack() }
+                    .onFailure { Toast.makeText(context, "ย้ายไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+            }) { Text("ย้ายมาที่นี่") } },
+            dismissButton = { TextButton(onClick = { showMove = false }) { Text("ยกเลิก") } }
+        )
     }
 
     if (showInfo) AlertDialog(
