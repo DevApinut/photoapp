@@ -40,10 +40,22 @@ interface AppDao {
             SELECT d.id AS id, 'DOCUMENT' AS kind, d.contentUri AS contentUri, d.filename AS filename,
                    d.mimeType AS mimeType, j.name AS jobName, l.name AS locationName, d.createdAt AS capturedAt
             FROM documents d JOIN locations l ON l.id=d.locationId JOIN jobs j ON j.id=l.jobId
-        ) WHERE filename LIKE '%' || :query || '%' COLLATE NOCASE
+        ) WHERE filename LIKE '%' || replace(trim(:query), ' ', '%') || '%' COLLATE NOCASE
         ORDER BY capturedAt DESC LIMIT 200
     """)
     fun searchLocalFiles(query: String): Flow<List<LocalFileSearchResult>>
+    @Query("""
+        SELECT * FROM (
+            SELECT p.id AS id, 'PHOTO' AS kind, p.contentUri AS contentUri, p.filename AS filename,
+                   'image/jpeg' AS mimeType, j.name AS jobName, l.name AS locationName, p.capturedAt AS capturedAt
+            FROM photos p JOIN locations l ON l.id=p.locationId JOIN jobs j ON j.id=l.jobId
+            UNION ALL
+            SELECT d.id AS id, 'DOCUMENT' AS kind, d.contentUri AS contentUri, d.filename AS filename,
+                   d.mimeType AS mimeType, j.name AS jobName, l.name AS locationName, d.createdAt AS capturedAt
+            FROM documents d JOIN locations l ON l.id=d.locationId JOIN jobs j ON j.id=l.jobId
+        ) ORDER BY capturedAt DESC LIMIT 5000
+    """)
+    fun allLocalFiles(): Flow<List<LocalFileSearchResult>>
     @Query("""
         SELECT j.id AS jobId, MAX(p.capturedAt) AS lastPhotoAt
         FROM jobs j LEFT JOIN locations l ON l.jobId=j.id LEFT JOIN photos p ON p.locationId=l.id
@@ -94,9 +106,13 @@ interface AppDao {
     @Query("SELECT * FROM notes WHERE locationId=:locationId") suspend fun notesNow(locationId: String): List<NoteEntity>
     @Query("UPDATE photos SET sha256 = :sha256 WHERE id = :id")
     suspend fun updatePhotoHash(id: String, sha256: String)
+    @Query("UPDATE photos SET filename=:filename, status='WAITING', lastError=NULL WHERE id=:id")
+    suspend fun renamePhoto(id: String, filename: String)
     @Query("SELECT * FROM documents WHERE locationId=:locationId ORDER BY createdAt DESC") fun documents(locationId: String): Flow<List<DocumentEntity>>
     @Query("SELECT * FROM notes WHERE locationId=:locationId ORDER BY updatedAt DESC") fun notes(locationId: String): Flow<List<NoteEntity>>
     @Query("DELETE FROM documents WHERE id=:id") suspend fun deleteDocument(id: String)
+    @Query("UPDATE documents SET filename=:filename, status='WAITING', lastError=NULL WHERE id=:id")
+    suspend fun renameDocument(id: String, filename: String)
     @Query("SELECT EXISTS(SELECT 1 FROM documents WHERE contentUri=:contentUri)") suspend fun documentUriExists(contentUri: String): Boolean
     @Query("DELETE FROM notes WHERE id=:id") suspend fun deleteNote(id: String)
     @Query("UPDATE notes SET title=:title, content=:content, updatedAt=:updatedAt, status='WAITING', lastError=NULL WHERE id=:id")

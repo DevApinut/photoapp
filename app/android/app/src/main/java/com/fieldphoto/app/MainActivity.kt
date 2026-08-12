@@ -32,8 +32,10 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
@@ -43,6 +45,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -59,13 +62,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -108,9 +116,32 @@ import kotlin.math.sign
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
+    private val incomingPdf = mutableStateOf<Uri?>(null)
+
+    @Suppress("DEPRECATION")
+    private fun acceptPdfIntent(source: Intent?) {
+        if (source?.type != "application/pdf") return
+        incomingPdf.value = when (source.action) {
+            Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= 33)
+                source.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            else source.getParcelableExtra(Intent.EXTRA_STREAM)
+            Intent.ACTION_VIEW -> source.data
+            else -> null
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { MaterialTheme { PhotoWorkApp((application as PhotoApp).repository) } }
+        acceptPdfIntent(intent)
+        setContent { MaterialTheme {
+            PhotoWorkApp((application as PhotoApp).repository, incomingPdf.value) { incomingPdf.value = null }
+        } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        acceptPdfIntent(intent)
     }
 }
 
@@ -122,6 +153,7 @@ private sealed interface Page {
     data class Viewer(val photos: List<PhotoEntity>, val initialIndex: Int) : Page
     data class CloudJob(val jobId: String, val clientName: String, val jobName: String) : Page
     data class CloudPdf(val document: CloudDocument) : Page
+    data class LocalPdf(val document: DocumentEntity) : Page
     data class CloudViewer(val photos: List<CloudPhoto>, val initialIndex: Int) : Page
     data class Camera(val place: LocationEntity, val title: String = place.name) : Page
     data object Settings : Page
@@ -153,6 +185,92 @@ private fun displayDateTime(value: String?): String = value?.let {
 
 private fun localDateOf(value: String?): LocalDate? = value?.let {
     runCatching { OffsetDateTime.parse(it).toLocalDate() }.getOrNull()
+}
+
+private fun editDistance(left: String, right: String): Int {
+    if (left == right) return 0
+    if (left.isEmpty()) return right.length
+    var previous = IntArray(right.length + 1) { it }
+    left.forEachIndexed { i, a ->
+        val current = IntArray(right.length + 1); current[0] = i + 1
+        right.forEachIndexed { j, b -> current[j + 1] = minOf(current[j] + 1, previous[j + 1] + 1, previous[j] + if (a == b) 0 else 1) }
+        previous = current
+    }
+    return previous[right.length]
+}
+
+private fun fuzzyFilenameMatch(filename: String, rawQuery: String): Boolean {
+    val name = filename.substringBeforeLast('.').lowercase()
+    val words = name.split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotBlank() }
+    val tokens = rawQuery.lowercase().trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+    return tokens.all { token ->
+        name.contains(token) || words.any { word ->
+            val tolerance = when { token.any(Char::isDigit) || token.length < 4 -> 0; token.length >= 8 -> 2; else -> 1 }
+            editDistance(token, word) <= tolerance
+        }
+    }
+}
+
+@Composable private fun PdfPageBitmap(
+    uri: Uri, pageIndex: Int, scale: Float, horizontalOffset: Float,
+) {
+    val context = LocalContext.current
+    var bitmap by remember(uri, pageIndex) { mutableStateOf<Bitmap?>(null) }
+    var failed by remember(uri, pageIndex) { mutableStateOf(false) }
+    val renderLevel = when { scale >= 3f -> 2f; scale >= 1.5f -> 1.6f; else -> 1f }
+    LaunchedEffect(uri, pageIndex, renderLevel) {
+        if (renderLevel > 1f) delay(120)
+        val rendered = withContext(Dispatchers.IO) {
+            runCatching {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                    PdfRenderer(descriptor).use { renderer ->
+                        renderer.openPage(pageIndex).use { page ->
+                            // PdfRenderer reports PDF points (often only ~595 px for A4).
+                            // Always request a real high-resolution bitmap instead of
+                            // accidentally keeping that low native point width.
+                            val width = (2200 * renderLevel).toInt().coerceAtMost(3600)
+                            val height = (page.height * width.toFloat() / page.width).toInt()
+                            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { output ->
+                                output.eraseColor(android.graphics.Color.WHITE)
+                                page.render(output, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                            }
+                        }
+                    }
+                }
+            }.getOrNull()
+        }
+        if (rendered != null) {
+            val previous = bitmap
+            bitmap = rendered
+            failed = false
+            delay(250)
+            previous?.takeUnless(Bitmap::isRecycled)?.recycle()
+        } else failed = bitmap == null
+    }
+    DisposableEffect(uri, pageIndex) { onDispose { bitmap?.takeUnless(Bitmap::isRecycled)?.recycle(); bitmap = null } }
+    when {
+        bitmap != null -> {
+            val pageRatio = bitmap!!.width.toFloat() / bitmap!!.height
+            Box(
+            Modifier.fillMaxWidth()
+                .aspectRatio(pageRatio / scale)
+                .clipToBounds()
+        ) {
+            Image(
+                bitmap!!.asImageBitmap(), "PDF หน้า ${pageIndex + 1}",
+                Modifier.fillMaxWidth().aspectRatio(pageRatio).graphicsLayer {
+                    transformOrigin = TransformOrigin(0.5f, 0f)
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = horizontalOffset
+                },
+                contentScale = ContentScale.Fit
+            )
+        }
+        }
+        failed -> Box(Modifier.fillMaxWidth().height(180.dp), contentAlignment = Alignment.Center) { Text("เปิดหน้านี้ไม่สำเร็จ", color = MaterialTheme.colorScheme.error) }
+        else -> Box(Modifier.fillMaxWidth().height(240.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+    }
 }
 
 @Composable
@@ -211,7 +329,7 @@ private fun saveFolderTemplates(context: Context, templates: List<FolderTemplate
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-private fun PhotoWorkApp(repo: PhotoRepository) {
+private fun PhotoWorkApp(repo: PhotoRepository, incomingPdf: Uri? = null, clearIncomingPdf: () -> Unit = {}) {
     var page by remember { mutableStateOf<Page>(Page.Clients) }
     LaunchedEffect(Unit) { repo.cleanupLegacyEmptyTestJob() }
     val history = remember { mutableStateListOf<Page>() }
@@ -232,6 +350,26 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
     var syncProgress by remember { mutableStateOf<SyncProgress?>(null) }
     var syncModeDialog by remember { mutableStateOf(false) }
     var recoveryNavigationChecked by remember { mutableStateOf(false) }
+    var pdfImportTargets by remember { mutableStateOf<List<Pair<JobEntity, LocationEntity>>>(emptyList()) }
+    var pdfBrowseJobId by remember { mutableStateOf<String?>(null) }
+    var pdfBrowsePath by remember { mutableStateOf("") }
+    var importingSharedPdf by remember { mutableStateOf(false) }
+
+    LaunchedEffect(incomingPdf) {
+        if (incomingPdf != null) {
+            val jobs = repo.dao.allJobsNow().associateBy { it.id }
+            pdfImportTargets = repo.dao.allLocationsNow().mapNotNull { location -> jobs[location.jobId]?.let { it to location } }
+            pdfBrowseJobId = null
+            pdfBrowsePath = ""
+        }
+    }
+
+    fun sharedPdfPickerBack() {
+        if (pdfBrowseJobId == null) clearIncomingPdf()
+        else if (pdfBrowsePath.isBlank()) pdfBrowseJobId = null
+        else pdfBrowsePath = pdfBrowsePath.substringBeforeLast('/', "")
+    }
+    BackHandler(enabled = incomingPdf != null && !importingSharedPdf) { sharedPdfPickerBack() }
 
     BackHandler(enabled = page !is Page.Clients) { back() }
 
@@ -279,11 +417,11 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
 
     Scaffold(
         topBar = {
-            if (page !is Page.Viewer && page !is Page.CloudViewer) TopAppBar(
+            if (page !is Page.Viewer && page !is Page.CloudViewer && page !is Page.LocalPdf) TopAppBar(
                 title = { Text(when (val p = page) {
                     Page.Clients -> "งานทั้งหมด"; is Page.Jobs -> p.client.name; is Page.Places -> p.job.name
                     is Page.Photos -> p.title; is Page.Camera -> "ถ่ายรูป — ${p.title}"; Page.Settings -> "ตั้งค่า"; Page.FileSearch -> "ค้นหาไฟล์"
-                    is Page.Viewer -> "รูปภาพ"; is Page.CloudJob -> "${p.jobName} — Server"; is Page.CloudPdf -> p.document.filename; is Page.CloudViewer -> "รูปบน Server"
+                    is Page.Viewer -> "รูปภาพ"; is Page.CloudJob -> "${p.jobName} — Server"; is Page.CloudPdf -> p.document.filename; is Page.LocalPdf -> p.document.filename; is Page.CloudViewer -> "รูปบน Server"
                 }) },
                 navigationIcon = { if (page !is Page.Clients) IconButton(onClick = { back() }) { Icon(Icons.Default.ArrowBack, "กลับ") } },
                 actions = {
@@ -307,6 +445,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 is Page.Photos -> PhotosPage(repo, serverUrl, p.place, p.title,
                     openPhoto = { photos, index -> navigate(Page.Viewer(photos, index)) },
                     openCloudPhoto = { photos, index -> navigate(Page.CloudViewer(photos, index)) },
+                    openPdf = { navigate(Page.LocalPdf(it)) },
                     openFolder = { folder ->
                         navigate(Page.Photos(folder, "${p.title} › ${folder.name.substringAfterLast('/')}") )
                     })
@@ -316,6 +455,7 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                     openPdf = { navigate(Page.CloudPdf(it)) },
                     openPhoto = { photos, index -> navigate(Page.CloudViewer(photos, index)) })
                 is Page.CloudPdf -> CloudPdfPage(serverUrl, p.document)
+                is Page.LocalPdf -> LocalPdfReader(repo, p.document) { back() }
                 is Page.CloudViewer -> CloudPhotoViewer(repo, serverUrl, p.photos, p.initialIndex) { back() }
                 Page.Settings -> SettingsPage(serverUrl, showTimestamp,
                     saveUrl = { serverUrl = it; prefs.edit().putString("server_url", it).apply() },
@@ -366,6 +506,84 @@ private fun PhotoWorkApp(repo: PhotoRepository) {
                 },
                 confirmButton = {},
                 dismissButton = { TextButton(onClick = { syncModeDialog = false }) { Text("ยกเลิก") } }
+            )
+            if (incomingPdf != null) AlertDialog(
+                onDismissRequest = { if (!importingSharedPdf) clearIncomingPdf() },
+                title = { Text("เก็บ PDF ไว้ที่ไหน?") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        val browseJob = pdfBrowseJobId?.let { id -> pdfImportTargets.firstOrNull { it.first.id == id }?.first }
+                        val currentTarget = pdfBrowseJobId?.let { jobId ->
+                            pdfImportTargets.firstOrNull { it.first.id == jobId && it.second.name == pdfBrowsePath }
+                        }
+                        val jobs = pdfImportTargets.map { it.first }.distinctBy { it.id }.sortedBy { it.name.lowercase() }
+                        val prefix = if (pdfBrowsePath.isBlank()) "" else "$pdfBrowsePath/"
+                        val children = pdfBrowseJobId?.let { jobId -> pdfImportTargets.filter { (_, location) ->
+                            location.jobId == jobId && location.name.startsWith(prefix) &&
+                                location.name != pdfBrowsePath && !location.name.removePrefix(prefix).contains('/')
+                        }.sortedBy { it.second.name.lowercase() } }.orEmpty()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = ::sharedPdfPickerBack, enabled = !importingSharedPdf) {
+                                Icon(Icons.Default.ArrowBack, "ย้อนกลับ")
+                            }
+                            Column {
+                                Text(browseJob?.name ?: "เลือกงาน", fontWeight = FontWeight.Bold)
+                                if (browseJob != null) Text(
+                                    pdfBrowsePath.ifBlank { "โฟลเดอร์หลัก" },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        if (importingSharedPdf) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 390.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (pdfBrowseJobId == null) items(jobs, key = { it.id }) { job ->
+                                ElevatedCard(Modifier.fillMaxWidth().clickable(enabled = !importingSharedPdf) {
+                                    pdfBrowseJobId = job.id; pdfBrowsePath = ""
+                                }) { Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Work, null); Spacer(Modifier.width(10.dp))
+                                    Text(job.name, Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                                    Icon(Icons.Default.ChevronRight, null)
+                                } }
+                            } else items(children, key = { it.second.id }) { (_, location) ->
+                                ElevatedCard(Modifier.fillMaxWidth().clickable(enabled = !importingSharedPdf) { pdfBrowsePath = location.name }) {
+                                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Folder, null); Spacer(Modifier.width(10.dp))
+                                        Text(location.name.substringAfterLast('/'), Modifier.weight(1f))
+                                        Icon(Icons.Default.ChevronRight, null)
+                                    }
+                                }
+                            }
+                            if (pdfBrowseJobId != null && children.isEmpty()) item {
+                                Text("ไม่มีโฟลเดอร์ย่อย", Modifier.fillMaxWidth().padding(20.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        Text("เข้าไปยังตำแหน่งที่ต้องการ แล้วกด “เก็บไว้ที่นี่”", style = MaterialTheme.typography.bodySmall)
+                        Button(
+                            enabled = currentTarget != null && !importingSharedPdf,
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                val (job, location) = currentTarget ?: return@Button
+                                importingSharedPdf = true
+                                scope.launch {
+                                    runCatching {
+                                        runCatching { context.contentResolver.takePersistableUriPermission(incomingPdf, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                                        repo.importPdf(location.id, incomingPdf)
+                                    }.onSuccess {
+                                        clearIncomingPdf(); importingSharedPdf = false
+                                        navigate(Page.Photos(location, job.name))
+                                        Toast.makeText(context, "เก็บ PDF ใน ${job.name} แล้ว", Toast.LENGTH_LONG).show()
+                                    }.onFailure {
+                                        importingSharedPdf = false
+                                        Toast.makeText(context, "นำเข้า PDF ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        ) { Text("เก็บไว้ที่นี่") }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(enabled = !importingSharedPdf, onClick = clearIncomingPdf) { Text("ยกเลิก") } }
             )
         }
     }
@@ -1035,7 +1253,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
 @Composable private fun PhotosPage(
     repo: PhotoRepository, serverUrl: String, place: LocationEntity, pageTitle: String,
     openPhoto: (List<PhotoEntity>, Int) -> Unit, openCloudPhoto: (List<CloudPhoto>, Int) -> Unit,
-    openFolder: (LocationEntity) -> Unit
+    openPdf: (DocumentEntity) -> Unit, openFolder: (LocationEntity) -> Unit
 ) {
     val rows by repo.dao.photos(place.id).collectAsStateWithLifecycle(emptyList())
     val documents by repo.dao.documents(place.id).collectAsStateWithLifecycle(emptyList())
@@ -1066,6 +1284,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var documentToDelete by remember { mutableStateOf<DocumentEntity?>(null) }
     var photosAwaitingDeleteApproval by remember { mutableStateOf<List<PhotoEntity>>(emptyList()) }
     var photoDeleteOptions by remember { mutableStateOf<PhotoEntity?>(null) }
+    var photoToRename by remember { mutableStateOf<PhotoEntity?>(null) }
+    var documentToRename by remember { mutableStateOf<DocumentEntity?>(null) }
     var showSelectedDeleteOptions by remember { mutableStateOf(false) }
     var recoveryCandidates by remember { mutableStateOf<List<RecentImage>>(emptyList()) }
     var recoveryVideoCandidates by remember { mutableStateOf<List<RecentVideo>>(emptyList()) }
@@ -1601,6 +1821,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     onClick = {
                         if (selectedDocumentIds.isNotEmpty()) {
                             selectedDocumentIds = if (isSelected) selectedDocumentIds - document.id else selectedDocumentIds + document.id
+                        } else if (document.mimeType == "application/pdf") {
+                            openPdf(document)
                         } else {
                             val intent = Intent(Intent.ACTION_VIEW).apply {
                                 setDataAndType(Uri.parse(document.contentUri), document.mimeType)
@@ -1641,6 +1863,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                             runCatching { context.startActivity(Intent.createChooser(share, "แชร์ ${document.filename}")) }
                                 .onFailure { Toast.makeText(context, "ไม่พบแอปสำหรับแชร์ไฟล์", Toast.LENGTH_SHORT).show() }
                         }) { Icon(Icons.Default.Share, "แชร์ไฟล์") }
+                        if (selectedDocumentIds.isEmpty()) IconButton(onClick = { documentToRename = document }) {
+                            Icon(Icons.Default.Edit, "เปลี่ยนชื่อไฟล์")
+                        }
                         if (selectedDocumentIds.isEmpty()) IconButton(onClick = { documentToDelete = document }) { Icon(Icons.Default.Delete, "ลบไฟล์") }
                     }
                 }
@@ -1960,14 +2185,20 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     photoDeleteOptions?.let { photo ->
         val photoUri = Uri.parse(photo.contentUri)
         val canDeleteFromDn = repo.media.canRequestDelete(photoUri)
+        val canRenameFromDn = photo.relativePath.contains("MyPhotoApp", ignoreCase = true)
         AlertDialog(
             onDismissRequest = { photoDeleteOptions = null },
             title = { Text("จัดการรูปนี้") },
             text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
                     if (canDeleteFromDn) "เลือกว่าจะเอารูปออกจาก DN อย่างเดียว หรือจะลบไฟล์ออกจาก Gallery และเครื่องด้วย"
                     else "รูปนี้นำเข้าผ่าน Android Photo Picker หากต้องการลบไฟล์ต้นฉบับ ให้เปิดรูปใน Gallery แล้วลบจาก Gallery"
                 )
+                if (canRenameFromDn) OutlinedButton(onClick = { photoDeleteOptions = null; photoToRename = photo }) {
+                    Icon(Icons.Default.Edit, null); Spacer(Modifier.width(8.dp)); Text("เปลี่ยนชื่อรูป")
+                }
+                }
             },
             confirmButton = {
                 Button(
@@ -2000,6 +2231,18 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 }) { Text("เอาออกจาก DN แต่เก็บใน Gallery") }
             }
         )
+    }
+    photoToRename?.let { photo ->
+        RenameDialog("เปลี่ยนชื่อรูป", photo.filename.substringBeforeLast('.'), { photoToRename = null }) { value ->
+            scope.launch { runCatching { repo.renamePhoto(photo, value) }
+                .onSuccess { photoToRename = null }.onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+        }
+    }
+    documentToRename?.let { document ->
+        RenameDialog("เปลี่ยนชื่อไฟล์", document.filename.substringBeforeLast('.'), { documentToRename = null }) { value ->
+            scope.launch { runCatching { repo.renameDocument(document, value) }
+                .onSuccess { documentToRename = null }.onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+        }
     }
     if (showSelectedDeleteOptions) AlertDialog(
         onDismissRequest = { showSelectedDeleteOptions = false },
@@ -2181,10 +2424,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     val preferences = remember { context.getSharedPreferences("file_search", Context.MODE_PRIVATE) }
     var query by remember { mutableStateOf(preferences.getString("query", "").orEmpty()) }
     var typeFilter by remember { mutableStateOf("ALL") }
-    val resultFlow = remember(query) {
-        query.trim().takeIf { it.isNotEmpty() }?.let { repo.dao.searchLocalFiles(it) } ?: flowOf(emptyList())
-    }
-    val results by resultFlow.collectAsStateWithLifecycle(emptyList())
+    val allResults by repo.dao.allLocalFiles().collectAsStateWithLifecycle(emptyList())
+    val results = remember(allResults, query) { if (query.isBlank()) emptyList() else allResults.filter { fuzzyFilenameMatch(it.filename, query) } }
     val visibleResults = results.filter { item ->
         when (typeFilter) {
             "PHOTO" -> item.kind == "PHOTO"
@@ -2799,6 +3040,232 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             dismissButton = { TextButton(onClick = { selected = null }, enabled = downloading == null) { Text("ปิด") } }
         )
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun LocalPdfReader(repo: PhotoRepository, document: DocumentEntity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val preferences = remember { context.getSharedPreferences("pdf_reading", Context.MODE_PRIVATE) }
+    val rememberedPage = preferences.getInt("page_${document.id}", 0).coerceIn(0, (document.pageCount - 1).coerceAtLeast(0))
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = rememberedPage)
+    var pdfReady by remember(document.id) { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var query by remember { mutableStateOf("") }
+    var showSearch by remember { mutableStateOf(false) }
+    var showSelectableText by remember { mutableStateOf(false) }
+    var selectablePageText by remember { mutableStateOf("") }
+    var selectableTextLoading by remember { mutableStateOf(false) }
+    var matches by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var searching by remember { mutableStateOf(false) }
+    var showTools by remember { mutableStateOf(false) }
+    var firstPage by remember { mutableStateOf("1") }
+    var lastPage by remember { mutableStateOf(document.pageCount.toString()) }
+    var busy by remember { mutableStateOf(false) }
+    var showGoToPage by remember { mutableStateOf(false) }
+    var pageInput by remember { mutableStateOf((rememberedPage + 1).toString()) }
+    var pdfScale by remember(document.id) { mutableFloatStateOf(1f) }
+    var pdfHorizontalOffset by remember(document.id) { mutableFloatStateOf(0f) }
+    var readerHeightPx by remember { mutableIntStateOf(0) }
+    var readerWidthPx by remember { mutableIntStateOf(0) }
+    val density = LocalDensity.current
+
+    LaunchedEffect(document.contentUri) {
+        runCatching {
+            withContext(Dispatchers.IO) {
+                context.contentResolver.openFileDescriptor(Uri.parse(document.contentUri), "r")?.use { descriptor ->
+                    PdfRenderer(descriptor).use { renderer -> require(renderer.pageCount > 0) { "PDF ไม่มีหน้า" } }
+                } ?: error("เปิด PDF ไม่สำเร็จ")
+            }
+        }.onSuccess { pdfReady = true }.onFailure { error = it.message }
+    }
+    LaunchedEffect(listState.firstVisibleItemIndex) {
+        preferences.edit().putInt("page_${document.id}", listState.firstVisibleItemIndex).apply()
+    }
+    LaunchedEffect(showSelectableText, listState.firstVisibleItemIndex) {
+        if (showSelectableText) {
+            selectableTextLoading = true
+            runCatching { repo.pdfPageText(document, listState.firstVisibleItemIndex + 1) }
+                .onSuccess { selectablePageText = it }
+                .onFailure { selectablePageText = ""; Toast.makeText(context, "อ่านข้อความไม่ได้: ${it.message}", Toast.LENGTH_LONG).show() }
+            selectableTextLoading = false
+        }
+    }
+
+    Scaffold(
+        topBar = { TopAppBar(
+            title = { Column {
+                Text(document.filename, maxLines = 1)
+                Text(
+                    "หน้า ${listState.firstVisibleItemIndex + 1}/${document.pageCount} • แตะเพื่อไปยังหน้า",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.clickable {
+                        pageInput = (listState.firstVisibleItemIndex + 1).toString()
+                        showGoToPage = true
+                    }
+                )
+            } },
+            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "กลับ") } },
+            actions = {
+                IconButton(onClick = { showSelectableText = !showSelectableText; showSearch = false }) {
+                    Icon(if (showSelectableText) Icons.Default.PictureAsPdf else Icons.Default.ContentCopy,
+                        if (showSelectableText) "กลับไปดู PDF" else "เลือกและคัดลอกข้อความ")
+                }
+                IconButton(onClick = { showSearch = !showSearch; if (!showSearch) { query = ""; matches = emptyList() } }) {
+                    Icon(if (showSearch) Icons.Default.Close else Icons.Default.Search, if (showSearch) "ปิดค้นหา" else "ค้นหาข้อความ")
+                }
+                IconButton(onClick = { showTools = true }) { Icon(Icons.Default.Build, "เครื่องมือ PDF") }
+            }
+        ) }
+    ) { padding ->
+        Column(Modifier.padding(padding).fillMaxSize()) {
+            if (showSearch) Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, label = { Text("ค้นหาข้อความใน PDF") })
+                IconButton(enabled = query.isNotBlank() && !searching, onClick = {
+                    searching = true; scope.launch { runCatching { repo.searchPdf(document, query) }
+                        .onSuccess { matches = it; if (it.isNotEmpty()) listState.animateScrollToItem(it.first() - 1)
+                            else Toast.makeText(context, "ไม่พบข้อความนี้ใน PDF", Toast.LENGTH_LONG).show() }
+                        .onFailure { Toast.makeText(context, "ค้นหาไม่ได้: ${it.message}", Toast.LENGTH_LONG).show() }; searching = false }
+                }) { if (searching) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Search, "ค้นหา") }
+            }
+            if (showSearch && searching) Text("กำลังค้นหาข้อความและตรวจ OCR ทีละหน้า…", Modifier.padding(horizontal = 12.dp), style = MaterialTheme.typography.bodySmall)
+            if (showSearch && matches.isNotEmpty()) Text("พบในหน้า ${matches.joinToString()}", Modifier.padding(horizontal = 12.dp), style = MaterialTheme.typography.bodySmall)
+            when { error != null -> Text(error!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp))
+                showSelectableText -> when {
+                    selectableTextLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                    selectablePageText.isBlank() -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                        Text("หน้านี้ไม่มีข้อความที่เลือกได้\nหากเป็นเอกสารสแกน ต้องใช้ OCR ก่อน", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> SelectionContainer {
+                        Text(
+                            selectablePageText,
+                            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
+                }
+                !pdfReady -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                else -> Box(
+                    Modifier.fillMaxSize().onSizeChanged { readerHeightPx = it.height; readerWidthPx = it.width }
+                        .pointerInput(document.id) {
+                            detectTapGestures(onDoubleTap = { tap ->
+                                if (pdfScale > 1.05f) {
+                                    pdfScale = 1f; pdfHorizontalOffset = 0f
+                                } else {
+                                    val nextScale = 2.5f
+                                    pdfHorizontalOffset = ((size.width / 2f - tap.x) * (nextScale - 1f))
+                                        .coerceIn(-size.width * .75f, size.width * .75f)
+                                    pdfScale = nextScale
+                                }
+                            })
+                        }
+                        .pointerInput(document.id) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pressed = event.changes.count { it.pressed }
+                                    val pan = event.calculatePan()
+                                    if (pressed >= 2) {
+                                        val oldScale = pdfScale
+                                        val newScale = (oldScale * event.calculateZoom()).coerceIn(1f, 6f)
+                                        val applied = newScale / oldScale
+                                        val focalX = event.calculateCentroid().x - size.width / 2f
+                                        val limit = size.width * (newScale - 1f) / 2f
+                                        pdfHorizontalOffset = if (newScale <= 1f) 0f else
+                                            (focalX + (pdfHorizontalOffset - focalX) * applied + pan.x).coerceIn(-limit, limit)
+                                        pdfScale = newScale
+                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    } else if (pressed == 1 && pdfScale > 1.05f && kotlin.math.abs(pan.x) > kotlin.math.abs(pan.y)) {
+                                        val limit = size.width * (pdfScale - 1f) / 2f
+                                        pdfHorizontalOffset = (pdfHorizontalOffset + pan.x).coerceIn(-limit, limit)
+                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    }
+                                } while (event.changes.any { it.pressed })
+                            }
+                        }
+                ) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize().padding(end = if (document.pageCount > 1) 18.dp else 0.dp),
+                        contentPadding = PaddingValues(bottom = 48.dp),
+                        verticalArrangement = Arrangement.spacedBy(0.dp)
+                    ) {
+                        items(document.pageCount, key = { it }) { index ->
+                            PdfPageBitmap(
+                                Uri.parse(document.contentUri), index,
+                                scale = pdfScale, horizontalOffset = pdfHorizontalOffset
+                            )
+                        }
+                    }
+                    if (document.pageCount > 1 && readerHeightPx > 0) {
+                        val thumbHeightPx = with(density) { 52.dp.toPx() }
+                        val travelPx = (readerHeightPx - thumbHeightPx).coerceAtLeast(1f)
+                        val fraction = listState.firstVisibleItemIndex.toFloat() / (document.pageCount - 1)
+                        fun jumpTo(y: Float) {
+                            val target = ((y - thumbHeightPx / 2f).coerceIn(0f, travelPx) / travelPx * (document.pageCount - 1)).toInt()
+                            scope.launch { listState.scrollToItem(target) }
+                        }
+                        Box(
+                            Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(28.dp)
+                                .pointerInput(document.id, readerHeightPx) {
+                                    detectVerticalDragGestures(
+                                        onDragStart = { jumpTo(it.y) },
+                                        onVerticalDrag = { change, _ -> change.consume(); jumpTo(change.position.y) }
+                                    )
+                                },
+                            contentAlignment = Alignment.TopCenter
+                        ) {
+                            Box(Modifier.fillMaxHeight().width(4.dp).background(Color.Black.copy(alpha = 0.16f), RoundedCornerShape(50)))
+                            Box(
+                                Modifier.offset { IntOffset(0, (fraction * travelPx).toInt()) }
+                                    .width(9.dp).height(52.dp)
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.78f), RoundedCornerShape(50))
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (showTools) AlertDialog(
+        onDismissRequest = { if (!busy) showTools = false }, title = { Text("บันทึกหน้า PDF") },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("กำหนดช่วงหน้า 1–${document.pageCount}")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(firstPage, { firstPage = it.filter(Char::isDigit) }, Modifier.weight(1f), label = { Text("หน้าแรก") }, singleLine = true)
+                OutlinedTextField(lastPage, { lastPage = it.filter(Char::isDigit) }, Modifier.weight(1f), label = { Text("หน้าสุดท้าย") }, singleLine = true)
+            }
+            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            Button(enabled = !busy, onClick = { busy = true; scope.launch {
+                runCatching { repo.savePdfRange(document, firstPage.toIntOrNull() ?: 1, lastPage.toIntOrNull() ?: document.pageCount) }
+                    .onSuccess { Toast.makeText(context, "สร้าง PDF ช่วงหน้าแล้ว", Toast.LENGTH_LONG).show(); showTools = false }
+                    .onFailure { Toast.makeText(context, "สร้าง PDF ไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }; busy = false
+            } }, modifier = Modifier.fillMaxWidth()) { Text("บันทึกช่วงหน้าเป็น PDF ใหม่") }
+            OutlinedButton(enabled = !busy, onClick = { busy = true; scope.launch {
+                runCatching { repo.exportPdfPagesAsImages(document, firstPage.toIntOrNull() ?: 1, lastPage.toIntOrNull() ?: document.pageCount) }
+                    .onSuccess { Toast.makeText(context, "บันทึกเป็นรูป $it หน้าแล้ว", Toast.LENGTH_LONG).show(); showTools = false }
+                    .onFailure { Toast.makeText(context, "แปลงเป็นรูปไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }; busy = false
+            } }, modifier = Modifier.fillMaxWidth()) { Text("บันทึกแต่ละหน้าเป็นรูป") }
+        } }, confirmButton = {}, dismissButton = { TextButton(enabled = !busy, onClick = { showTools = false }) { Text("ปิด") } }
+    )
+    if (showGoToPage) AlertDialog(
+        onDismissRequest = { showGoToPage = false },
+        title = { Text("ไปยังหน้า") },
+        text = { OutlinedTextField(
+            pageInput, { pageInput = it.filter(Char::isDigit) }, Modifier.fillMaxWidth(),
+            label = { Text("หมายเลขหน้า 1–${document.pageCount}") }, singleLine = true
+        ) },
+        confirmButton = { Button(
+            enabled = pageInput.toIntOrNull() in 1..document.pageCount,
+            onClick = {
+                val target = (pageInput.toInt() - 1).coerceIn(0, document.pageCount - 1)
+                showGoToPage = false
+                scope.launch { listState.scrollToItem(target) }
+            }
+        ) { Text("ไป") } },
+        dismissButton = { TextButton(onClick = { showGoToPage = false }) { Text("ยกเลิก") } }
+    )
 }
 
 @Composable private fun CloudPdfPage(serverUrl: String, document: CloudDocument) {

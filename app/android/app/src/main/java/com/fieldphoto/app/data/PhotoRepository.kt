@@ -9,6 +9,13 @@ import android.os.Build
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.graphics.pdf.PdfRenderer
+import android.graphics.Bitmap
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import android.os.Environment
 import android.net.Uri
 import com.fieldphoto.app.media.MediaStoreManager
@@ -19,6 +26,7 @@ import com.fieldphoto.app.sync.CloudDocument
 import com.fieldphoto.app.sync.CloudNote
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.tasks.await
 import java.time.OffsetDateTime
 import java.util.UUID
 
@@ -558,6 +566,128 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
             throw error
         }
         dao.deleteDocument(document.id)
+    }
+
+    private fun cleanFilename(raw: String, extension: String): String {
+        val base = raw.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_").removeSuffix(extension).removeSuffix(extension.uppercase())
+            .ifBlank { "FILE_${System.currentTimeMillis()}" }
+        return "$base$extension"
+    }
+
+    suspend fun renamePhoto(photo: PhotoEntity, requested: String) = withContext(Dispatchers.IO) {
+        val extension = photo.filename.substringAfterLast('.', "jpg").let { ".$it" }
+        val filename = cleanFilename(requested, extension)
+        context.contentResolver.update(Uri.parse(photo.contentUri), ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        }, null, null)
+        dao.renamePhoto(photo.id, filename)
+    }
+
+    suspend fun renameDocument(document: DocumentEntity, requested: String) = withContext(Dispatchers.IO) {
+        val extension = document.filename.substringAfterLast('.', if (document.mimeType.startsWith("video/")) "mp4" else "pdf").let { ".$it" }
+        val filename = cleanFilename(requested, extension)
+        context.contentResolver.update(Uri.parse(document.contentUri), ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        }, null, null)
+        dao.renameDocument(document.id, filename)
+    }
+
+    suspend fun searchPdf(document: DocumentEntity, query: String): List<Int> = withContext(Dispatchers.IO) {
+        if (query.isBlank()) return@withContext emptyList()
+        PDFBoxResourceLoader.init(context)
+        val textMatches = context.contentResolver.openInputStream(Uri.parse(document.contentUri)).use { input ->
+            PDDocument.load(requireNotNull(input)).use { pdf ->
+                (1..pdf.numberOfPages).filter { page ->
+                    PDFTextStripper().apply { startPage = page; endPage = page }.getText(pdf)
+                        .contains(query, ignoreCase = true)
+                }
+            }
+        }
+        if (textMatches.isNotEmpty()) return@withContext textMatches
+
+        // Scanned PDFs have no text layer. Fall back to on-device OCR page by page.
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        try {
+            val matches = mutableListOf<Int>()
+            context.contentResolver.openFileDescriptor(Uri.parse(document.contentUri), "r")?.use { descriptor ->
+                PdfRenderer(descriptor).use { renderer ->
+                    for (index in 0 until renderer.pageCount) renderer.openPage(index).use { page ->
+                        val width = 1600
+                        val height = (page.height * width.toFloat() / page.width).toInt()
+                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        val recognized = recognizer.process(InputImage.fromBitmap(bitmap, 0)).await().text
+                        bitmap.recycle()
+                        if (recognized.contains(query, ignoreCase = true)) matches += index + 1
+                    }
+                }
+            } ?: error("เปิด PDF เพื่อค้นหาไม่ได้")
+            matches
+        } finally { recognizer.close() }
+    }
+
+    suspend fun pdfPageText(document: DocumentEntity, page: Int): String = withContext(Dispatchers.IO) {
+        PDFBoxResourceLoader.init(context)
+        context.contentResolver.openInputStream(Uri.parse(document.contentUri)).use { input ->
+            PDDocument.load(requireNotNull(input)).use { pdf ->
+                val actualPage = page.coerceIn(1, pdf.numberOfPages)
+                PDFTextStripper().apply { startPage = actualPage; endPage = actualPage }.getText(pdf).trim()
+            }
+        }
+    }
+
+    suspend fun savePdfRange(document: DocumentEntity, firstPage: Int, lastPage: Int): DocumentEntity = withContext(Dispatchers.IO) {
+        PDFBoxResourceLoader.init(context)
+        val resolver = context.contentResolver
+        val first = firstPage.coerceIn(1, document.pageCount)
+        val last = lastPage.coerceIn(first, document.pageCount)
+        val filename = cleanFilename("${document.filename.substringBeforeLast('.')}_p${first}-${last}", ".pdf")
+        val target = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename); put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/DN"); put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }) ?: error("สร้าง PDF ไม่สำเร็จ")
+        try {
+            resolver.openInputStream(Uri.parse(document.contentUri)).use { input ->
+                PDDocument.load(requireNotNull(input)).use { source ->
+                    PDDocument().use { output ->
+                        for (index in first - 1 until last) output.importPage(source.getPage(index))
+                        resolver.openOutputStream(target).use { output.save(requireNotNull(it)) }
+                    }
+                }
+            }
+            resolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            DocumentEntity(UUID.randomUUID().toString(), document.locationId, target.toString(), filename,
+                media.sha256(target), last - first + 1, now()).also { dao.insertDocument(it) }
+        } catch (error: Throwable) { resolver.delete(target, null, null); throw error }
+    }
+
+    suspend fun exportPdfPagesAsImages(document: DocumentEntity, firstPage: Int, lastPage: Int): Int = withContext(Dispatchers.IO) {
+        val resolver = context.contentResolver
+        val first = firstPage.coerceIn(1, document.pageCount); val last = lastPage.coerceIn(first, document.pageCount)
+        val capturedAt = now()
+        var saved = 0
+        resolver.openFileDescriptor(Uri.parse(document.contentUri), "r")?.use { descriptor ->
+            PdfRenderer(descriptor).use { renderer ->
+                for (index in first - 1 until last) renderer.openPage(index).use { page ->
+                    val scale = (1800f / page.width).coerceAtLeast(1f)
+                    val bitmap = Bitmap.createBitmap((page.width * scale).toInt(), (page.height * scale).toInt(), Bitmap.Config.ARGB_8888)
+                    bitmap.eraseColor(android.graphics.Color.WHITE)
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    val filename = "${document.filename.substringBeforeLast('.')}_p${index + 1}.png"
+                    val target = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, filename); put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/MyPhotoApp/PDF"); put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }) ?: error("สร้างรูปหน้า ${index + 1} ไม่สำเร็จ")
+                    resolver.openOutputStream(target).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, requireNotNull(it)) }
+                    bitmap.recycle(); resolver.update(target, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                    dao.insertPhoto(PhotoEntity(UUID.randomUUID().toString(), document.locationId, media.sha256(target), target.toString(),
+                        Environment.DIRECTORY_PICTURES + "/MyPhotoApp/PDF", filename, capturedAt, null, null, null))
+                    saved++
+                }
+            }
+        } ?: error("เปิด PDF ไม่สำเร็จ")
+        saved
     }
 }
 
