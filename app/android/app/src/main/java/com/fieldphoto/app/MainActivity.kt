@@ -1293,6 +1293,13 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var showRecoveryDialog by remember { mutableStateOf(false) }
     var recoveryWithStamp by remember { mutableStateOf(false) }
     var oppoImportLoading by remember { mutableStateOf(false) }
+    var galleryImportLoading by remember { mutableStateOf(false) }
+    var galleryImportFinished by remember { mutableStateOf(false) }
+    var galleryImportCurrent by remember { mutableIntStateOf(0) }
+    var galleryImportTotal by remember { mutableIntStateOf(0) }
+    var galleryImportAdded by remember { mutableIntStateOf(0) }
+    var galleryImportSkipped by remember { mutableIntStateOf(0) }
+    var galleryImportFailed by remember { mutableIntStateOf(0) }
     var oppoGpsMissingDialog by remember { mutableStateOf(false) }
     var oppoPendingGpsPhotos by remember { mutableStateOf<List<Pair<Uri, Long>>>(emptyList()) }
     var oppoPendingGpsStamp by remember { mutableStateOf(false) }
@@ -1481,13 +1488,20 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             .addOnFailureListener { Toast.makeText(context, "เปิดสแกนเอกสารไม่ได้: ${it.message}", Toast.LENGTH_LONG).show() }
     }
     fun importGalleryUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        galleryImportTotal = uris.size
+        galleryImportCurrent = 0
+        galleryImportAdded = 0
+        galleryImportSkipped = 0
+        galleryImportFailed = 0
+        galleryImportFinished = false
+        galleryImportLoading = true
         scope.launch {
-            var added = 0
-            var protected = 0
-            uris.forEach { uri ->
+            uris.forEachIndexed { index, uri ->
+                galleryImportCurrent = index + 1
                 if (!repo.media.canRequestDelete(uri)) {
-                    protected++
-                    return@forEach
+                    galleryImportSkipped++
+                    return@forEachIndexed
                 }
                 runCatching {
                     val exif = repo.media.readExif(uri)
@@ -1495,14 +1509,9 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                         place.id, uri, exif.capturedAt ?: OffsetDateTime.now(),
                         exif.latitude, exif.longitude, null
                     )
-                }.onSuccess { added++ }
+                }.onSuccess { galleryImportAdded++ }.onFailure { galleryImportFailed++ }
             }
-            if (uris.isNotEmpty()) Toast.makeText(
-                context,
-                if (protected == 0) "เพิ่ม $added รูปโดยใช้ไฟล์เดิม ไม่สร้างสำเนา"
-                else "เพิ่ม $added รูป • ข้าม $protected รูปที่ Android ไม่ให้สิทธิ์ลบ",
-                Toast.LENGTH_LONG
-            ).show()
+            galleryImportFinished = true
         }
     }
     fun galleryPickIntent() = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
@@ -2302,6 +2311,32 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
             }
         },
         confirmButton = {}
+    )
+    if (galleryImportLoading) AlertDialog(
+        onDismissRequest = {},
+        title = { Text(if (galleryImportFinished) "นำเข้ารูปเสร็จแล้ว" else "กำลังนำเข้ารูป") },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (!galleryImportFinished) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    CircularProgressIndicator(Modifier.size(30.dp), strokeWidth = 3.dp)
+                    Text("กำลังอ่านข้อมูลและเพิ่มรูปเข้างาน กรุณารอสักครู่")
+                }
+                LinearProgressIndicator(
+                    progress = { galleryImportCurrent.toFloat() / galleryImportTotal },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("$galleryImportCurrent / $galleryImportTotal รูป", style = MaterialTheme.typography.bodySmall)
+            } else {
+                Text("สำเร็จ $galleryImportAdded รูป", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                if (galleryImportSkipped > 0) Text("ข้าม $galleryImportSkipped รูปที่ Android ไม่ให้สิทธิ์จัดการ")
+                if (galleryImportFailed > 0) Text("ผิดพลาด $galleryImportFailed รูป", color = MaterialTheme.colorScheme.error)
+                Text("รวมทั้งหมด $galleryImportTotal รูป", style = MaterialTheme.typography.bodySmall)
+            }
+        } },
+        confirmButton = { if (galleryImportFinished) Button(onClick = {
+            galleryImportLoading = false
+            galleryImportFinished = false
+        }) { Text("ดูรูปที่นำเข้า") } }
     )
     if (oppoGpsMissingDialog) AlertDialog(
         onDismissRequest = {},
