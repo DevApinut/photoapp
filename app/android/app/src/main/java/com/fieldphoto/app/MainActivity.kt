@@ -1420,6 +1420,8 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     }
     var pendingPhotoDelete by remember { mutableStateOf<PhotoEntity?>(null) }
     var pendingDocumentDelete by remember { mutableStateOf<DocumentEntity?>(null) }
+    var pendingPhotoRename by remember { mutableStateOf<Pair<PhotoEntity, String>?>(null) }
+    var pendingDocumentRename by remember { mutableStateOf<Pair<DocumentEntity, String>?>(null) }
     val mediaDeleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val photo = pendingPhotoDelete
         pendingPhotoDelete = null
@@ -1435,6 +1437,24 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                 repo.dao.deleteDocument(document.id)
                 Toast.makeText(context, if (document.mimeType.startsWith("video/")) "ลบวิดีโอออกจาก DN และ Gallery แล้ว" else "ลบไฟล์แล้ว", Toast.LENGTH_LONG).show()
             }
+        }
+    }
+    val photoRenameApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val pending = pendingPhotoRename
+        pendingPhotoRename = null
+        if (result.resultCode == Activity.RESULT_OK && pending != null) scope.launch {
+            runCatching { repo.renamePhoto(pending.first, pending.second) }
+                .onSuccess { photoToRename = null; Toast.makeText(context, "เปลี่ยนชื่อรูปแล้ว", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+        }
+    }
+    val documentRenameApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val pending = pendingDocumentRename
+        pendingDocumentRename = null
+        if (result.resultCode == Activity.RESULT_OK && pending != null) scope.launch {
+            runCatching { repo.renameDocument(pending.first, pending.second) }
+                .onSuccess { documentToRename = null; Toast.makeText(context, "เปลี่ยนชื่อไฟล์แล้ว", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
         }
     }
     val documentScanner = remember {
@@ -2194,7 +2214,6 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     photoDeleteOptions?.let { photo ->
         val photoUri = Uri.parse(photo.contentUri)
         val canDeleteFromDn = repo.media.canRequestDelete(photoUri)
-        val canRenameFromDn = photo.relativePath.contains("MyPhotoApp", ignoreCase = true)
         AlertDialog(
             onDismissRequest = { photoDeleteOptions = null },
             title = { Text("จัดการรูปนี้") },
@@ -2204,7 +2223,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
                     if (canDeleteFromDn) "เลือกว่าจะเอารูปออกจาก DN อย่างเดียว หรือจะลบไฟล์ออกจาก Gallery และเครื่องด้วย"
                     else "รูปนี้นำเข้าผ่าน Android Photo Picker หากต้องการลบไฟล์ต้นฉบับ ให้เปิดรูปใน Gallery แล้วลบจาก Gallery"
                 )
-                if (canRenameFromDn) OutlinedButton(onClick = { photoDeleteOptions = null; photoToRename = photo }) {
+                OutlinedButton(onClick = { photoDeleteOptions = null; photoToRename = photo }) {
                     Icon(Icons.Default.Edit, null); Spacer(Modifier.width(8.dp)); Text("เปลี่ยนชื่อรูป")
                 }
                 }
@@ -2244,13 +2263,29 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     photoToRename?.let { photo ->
         RenameDialog("เปลี่ยนชื่อรูป", photo.filename.substringBeforeLast('.'), { photoToRename = null }) { value ->
             scope.launch { runCatching { repo.renamePhoto(photo, value) }
-                .onSuccess { photoToRename = null }.onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+                .onSuccess { changedOnDevice ->
+                    photoToRename = null
+                    Toast.makeText(context, if (changedOnDevice) "เปลี่ยนชื่อใน DN และ Gallery แล้ว" else "เปลี่ยนชื่อใน DN และ Backup แล้ว", Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    if (error is MediaRenameApproval) {
+                        pendingPhotoRename = photo to value
+                        photoRenameApproval.launch(IntentSenderRequest.Builder(error.sender).build())
+                    } else Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show()
+                } }
         }
     }
     documentToRename?.let { document ->
         RenameDialog("เปลี่ยนชื่อไฟล์", document.filename.substringBeforeLast('.'), { documentToRename = null }) { value ->
             scope.launch { runCatching { repo.renameDocument(document, value) }
-                .onSuccess { documentToRename = null }.onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+                .onSuccess { changedOnDevice ->
+                    documentToRename = null
+                    Toast.makeText(context, if (changedOnDevice) "เปลี่ยนชื่อใน DN และเครื่องแล้ว" else "เปลี่ยนชื่อใน DN และ Backup แล้ว", Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    if (error is MediaRenameApproval) {
+                        pendingDocumentRename = document to value
+                        documentRenameApproval.launch(IntentSenderRequest.Builder(error.sender).build())
+                    } else Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show()
+                } }
         }
     }
     if (showSelectedDeleteOptions) AlertDialog(
@@ -2563,11 +2598,21 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     var moveJobId by remember { mutableStateOf<String?>(null) }
     var movePath by remember { mutableStateOf("") }
     var pendingDeleteApproval by remember { mutableStateOf(false) }
+    var pendingRename by remember { mutableStateOf<String?>(null) }
     val deleteApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK && pendingDeleteApproval) {
             pendingDeleteApproval = false
             scope.launch { repo.forgetPhoto(photo.id); onBack() }
         } else pendingDeleteApproval = false
+    }
+    val renameApproval = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val requested = pendingRename
+        pendingRename = null
+        if (result.resultCode == Activity.RESULT_OK && requested != null) scope.launch {
+            runCatching { repo.renamePhoto(photo, requested) }
+                .onSuccess { showRename = false; Toast.makeText(context, "เปลี่ยนชื่อรูปแล้ว", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() }
+        }
     }
     LaunchedEffect(pagerState.currentPage) { imageScale = 1f; imageOffset = Offset.Zero; edgePreview = 0f; showInfo = false }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -2724,7 +2769,7 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     if (showActions) AlertDialog(
         onDismissRequest = { showActions = false }, title = { Text("จัดการรูปนี้") },
         text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (photo.relativePath.contains("MyPhotoApp", true)) OutlinedButton(
+            OutlinedButton(
                 onClick = { showActions = false; showRename = true }, Modifier.fillMaxWidth()
             ) { Icon(Icons.Default.Edit, null); Spacer(Modifier.width(8.dp)); Text("เปลี่ยนชื่อ") }
             OutlinedButton(onClick = {
@@ -2743,8 +2788,16 @@ private fun <T> EntityList(rows: List<T>, label: (T) -> String, open: (T) -> Uni
     )
     if (showRename) RenameDialog("เปลี่ยนชื่อรูป", photo.filename.substringBeforeLast('.'), { showRename = false }) { value ->
         scope.launch { runCatching { repo.renamePhoto(photo, value) }
-            .onSuccess { showRename = false; Toast.makeText(context, "เปลี่ยนชื่อแล้ว", Toast.LENGTH_SHORT).show() }
-            .onFailure { Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${it.message}", Toast.LENGTH_LONG).show() } }
+            .onSuccess { changedOnDevice ->
+                showRename = false
+                Toast.makeText(context, if (changedOnDevice) "เปลี่ยนชื่อใน DN และ Gallery แล้ว" else "เปลี่ยนชื่อใน DN และ Backup แล้ว", Toast.LENGTH_SHORT).show()
+            }
+            .onFailure { error ->
+                if (error is MediaRenameApproval) {
+                    pendingRename = value
+                    renameApproval.launch(IntentSenderRequest.Builder(error.sender).build())
+                } else Toast.makeText(context, "เปลี่ยนชื่อไม่สำเร็จ: ${error.message}", Toast.LENGTH_LONG).show()
+            } }
     }
     if (showDeleteConfirm) AlertDialog(
         onDismissRequest = { showDeleteConfirm = false }, title = { Text("ลบรูปนี้?") },

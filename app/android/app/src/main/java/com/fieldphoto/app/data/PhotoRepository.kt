@@ -574,22 +574,39 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
         return "$base$extension"
     }
 
-    suspend fun renamePhoto(photo: PhotoEntity, requested: String) = withContext(Dispatchers.IO) {
+    suspend fun renamePhoto(photo: PhotoEntity, requested: String): Boolean = withContext(Dispatchers.IO) {
         val extension = photo.filename.substringAfterLast('.', "jpg").let { ".$it" }
         val filename = cleanFilename(requested, extension)
-        context.contentResolver.update(Uri.parse(photo.contentUri), ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-        }, null, null)
+        val renamedOnDevice = renameMediaOrRequestApproval(Uri.parse(photo.contentUri), filename)
         dao.renamePhoto(photo.id, filename)
+        renamedOnDevice
     }
 
-    suspend fun renameDocument(document: DocumentEntity, requested: String) = withContext(Dispatchers.IO) {
+    suspend fun renameDocument(document: DocumentEntity, requested: String): Boolean = withContext(Dispatchers.IO) {
         val extension = document.filename.substringAfterLast('.', if (document.mimeType.startsWith("video/")) "mp4" else "pdf").let { ".$it" }
         val filename = cleanFilename(requested, extension)
-        context.contentResolver.update(Uri.parse(document.contentUri), ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-        }, null, null)
+        val renamedOnDevice = renameMediaOrRequestApproval(Uri.parse(document.contentUri), filename)
         dao.renameDocument(document.id, filename)
+        renamedOnDevice
+    }
+
+    private fun renameMediaOrRequestApproval(uri: Uri, filename: String): Boolean {
+        return try {
+            context.contentResolver.update(uri, ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            }, null, null) > 0
+        } catch (error: RecoverableSecurityException) {
+            throw MediaRenameApproval(error.userAction.actionIntent.intentSender)
+        } catch (error: SecurityException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && uri.authority == MediaStore.AUTHORITY) {
+                throw MediaRenameApproval(
+                    MediaStore.createWriteRequest(context.contentResolver, listOf(uri)).intentSender
+                )
+            }
+            // Photo Picker/document providers may expose a permanently read-only URI. DN can
+            // still use the requested filename locally and when backing up without copying it.
+            false
+        }
     }
 
     suspend fun searchPdf(document: DocumentEntity, query: String): List<Int> = withContext(Dispatchers.IO) {
@@ -692,3 +709,4 @@ class PhotoRepository(private val context: Context, val dao: AppDao) {
 }
 
 class MediaDeleteApproval(val sender: IntentSender) : Exception("Media deletion needs user approval")
+class MediaRenameApproval(val sender: IntentSender) : Exception("Media rename needs user approval")
